@@ -4,10 +4,13 @@ Data Manager Dialog - UI for managing Master DB and cached data.
 
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton,
                              QLabel, QTableWidget, QTableWidgetItem, QHeaderView,
-                             QMessageBox, QInputDialog, QAbstractItemView)
+                             QMessageBox, QInputDialog, QAbstractItemView, QTabWidget, QWidget)
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont
 import os
+import pandas as pd
+from datetime import datetime
+from pathlib import Path
 
 from utils.cache_manager import CacheManager
 
@@ -17,8 +20,13 @@ class DataManagerDialog(QDialog):
     
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("数据管理中心 (Master DB Manager)")
-        self.setMinimumSize(900, 600)
+        self.setWindowTitle("数据管理中心 (Data Manager)")
+        self.setMinimumSize(1000, 700)
+        
+        # Ensure signals dir exists
+        self.signals_dir = Path("data/signals")
+        self.signals_dir.mkdir(parents=True, exist_ok=True)
+        
         self._init_ui()
         self.refresh_data()
     
@@ -36,9 +44,38 @@ class DataManagerDialog(QDialog):
         title.setFont(title_font)
         layout.addWidget(title)
         
-        # Master DB路径显示
-        path_layout = QHBoxLayout()
+        # Tabs
+        self.tabs = QTabWidget()
         
+        # Tab 1: Raw Data (Master DB)
+        self.tab_raw = QWidget()
+        self._init_raw_tab()
+        self.tabs.addTab(self.tab_raw, "原始行情 (Raw Data)")
+        
+        # Tab 2: Alpha Signals
+        self.tab_signals = QWidget()
+        self._init_signals_tab()
+        self.tabs.addTab(self.tab_signals, "策略信号 (Alpha Signals)")
+        
+        layout.addWidget(self.tabs)
+        
+        # Close button
+        close_btn = QPushButton("关闭")
+        close_btn.clicked.connect(self.accept)
+        close_btn.setMaximumWidth(100)
+        button_close_layout = QHBoxLayout()
+        button_close_layout.addStretch()
+        button_close_layout.addWidget(close_btn)
+        layout.addLayout(button_close_layout)
+        
+        self.setLayout(layout)
+
+    def _init_raw_tab(self):
+        """Initialize Raw Data Tab (Existing Logic)"""
+        layout = QVBoxLayout(self.tab_raw)
+        
+        # Master DB Path
+        path_layout = QHBoxLayout()
         self.path_label = QLabel(f"📁 Master DB位置: {os.path.abspath(CacheManager.STORE_DIR)}")
         self.path_label.setStyleSheet("color: #555; font-size: 11px;")
         path_layout.addWidget(self.path_label)
@@ -47,73 +84,50 @@ class DataManagerDialog(QDialog):
         open_folder_btn.clicked.connect(self._on_open_master_db_folder)
         open_folder_btn.setMaximumWidth(120)
         path_layout.addWidget(open_folder_btn)
-        
         layout.addLayout(path_layout)
         
-        # 统计信息
+        # Stats
         self.stats_label = QLabel()
         self.stats_label.setStyleSheet("font-size: 11px; color: #666;")
         layout.addWidget(self.stats_label)
         
-        # 🆕 磁盘空间警告标签
+        # Disk Warning
         self.disk_warning_label = QLabel()
         self.disk_warning_label.setStyleSheet("font-size: 11px; font-weight: bold;")
-        self.disk_warning_label.hide()  # 默认隐藏
+        self.disk_warning_label.hide()
         layout.addWidget(self.disk_warning_label)
         
-        # Master DB文件列表
-        list_label = QLabel("📂 已缓存的Master DB文件：")
-        list_label_font = QFont()
-        list_label_font.setBold(True)
-        list_label.setFont(list_label_font)
-        layout.addWidget(list_label)
-        
-        # 表格
+        # Table
         self.table = QTableWidget()
         self.table.setColumnCount(6)
         self.table.setHorizontalHeaderLabels([
             "代码", "时间粒度", "数据条数", "最新日期", "文件大小(MB)", "文件路径"
         ])
-        
-        # 表格样式
         header = self.table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
-        
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
         self.table.setAlternatingRowColors(True)
-        
-        # 🆕 连接双击事件用于预览
         self.table.doubleClicked.connect(self._on_preview_double_click)
-        
         layout.addWidget(self.table)
         
-        # 操作按钮行
+        # Buttons
         button_layout = QHBoxLayout()
         
         refresh_btn = QPushButton("🔄 刷新列表")
         refresh_btn.clicked.connect(self.refresh_data)
         button_layout.addWidget(refresh_btn)
         
-        # 🆕 预览按钮
         preview_btn = QPushButton("👁️ 预览数据")
         preview_btn.clicked.connect(self._on_preview_selected)
-        preview_btn.setToolTip("查看选中文件的前10行数据")
         button_layout.addWidget(preview_btn)
         
         export_btn = QPushButton("📤 导出选中为CSV")
         export_btn.clicked.connect(self._on_export_selected)
         button_layout.addWidget(export_btn)
         
-        # 🆕 批量导出按钮
         export_all_btn = QPushButton("📦 批量导出全部")
         export_all_btn.clicked.connect(self._on_export_all)
-        export_all_btn.setToolTip("将所有Master DB导出为CSV")
         button_layout.addWidget(export_all_btn)
         
         delete_btn = QPushButton("🗑️ 删除选中")
@@ -129,9 +143,8 @@ class DataManagerDialog(QDialog):
         button_layout.addStretch()
         layout.addLayout(button_layout)
         
-        # Exported data目录信息
+        # Exported Data Info
         exported_layout = QHBoxLayout()
-        
         self.exported_label = QLabel()
         self.exported_label.setStyleSheet("font-size: 11px; color: #666;")
         exported_layout.addWidget(self.exported_label)
@@ -140,21 +153,63 @@ class DataManagerDialog(QDialog):
         open_exported_btn.clicked.connect(self._on_open_exported_folder)
         open_exported_btn.setMaximumWidth(120)
         exported_layout.addWidget(open_exported_btn)
-        
         layout.addLayout(exported_layout)
+
+    def _init_signals_tab(self):
+        """Initialize Signals Tab"""
+        layout = QVBoxLayout(self.tab_signals)
         
-        # Close button
-        close_btn = QPushButton("关闭")
-        close_btn.clicked.connect(self.accept)
-        close_btn.setMaximumWidth(100)
-        button_close_layout = QHBoxLayout()
-        button_close_layout.addStretch()
-        button_close_layout.addWidget(close_btn)
-        layout.addLayout(button_close_layout)
+        # Path Info
+        path_layout = QHBoxLayout()
+        path_label = QLabel(f"📁 信号位置: {os.path.abspath(self.signals_dir)}")
+        path_label.setStyleSheet("color: #555; font-size: 11px;")
+        path_layout.addWidget(path_label)
         
-        self.setLayout(layout)
-    
+        open_btn = QPushButton("打开文件夹")
+        open_btn.clicked.connect(lambda: self._open_dir(self.signals_dir))
+        open_btn.setMaximumWidth(120)
+        path_layout.addWidget(open_btn)
+        layout.addLayout(path_layout)
+        
+        # Table
+        self.signal_table = QTableWidget()
+        self.signal_table.setColumnCount(5)
+        self.signal_table.setHorizontalHeaderLabels([
+            "信号文件", "修改时间", "大小(KB)", "标的资产", "数据条数"
+        ])
+        header = self.signal_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.signal_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.signal_table.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
+        self.signal_table.setAlternatingRowColors(True)
+        self.signal_table.doubleClicked.connect(self._on_signal_double_click)
+        layout.addWidget(self.signal_table)
+        
+        # Buttons
+        btn_layout = QHBoxLayout()
+        
+        refresh_btn = QPushButton("🔄 刷新")
+        refresh_btn.clicked.connect(self.refresh_signals)
+        btn_layout.addWidget(refresh_btn)
+        
+        preview_btn = QPushButton("👁️ 预览信号")
+        preview_btn.clicked.connect(self._on_preview_signal)
+        btn_layout.addWidget(preview_btn)
+        
+        del_btn = QPushButton("🗑️ 删除信号")
+        del_btn.clicked.connect(self._on_delete_signal)
+        del_btn.setStyleSheet("background-color: #ff6b6b; color: white;")
+        btn_layout.addWidget(del_btn)
+        
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+
     def refresh_data(self):
+        """Refresh all tabs"""
+        self.refresh_raw_data()
+        self.refresh_signals()
+
+    def refresh_raw_data(self):
         """刷新Master DB列表和统计信息"""
         # 获取Master DB信息
         file_list, total_files, total_size_mb = CacheManager.get_master_db_info()
@@ -196,18 +251,91 @@ class DataManagerDialog(QDialog):
             self.disk_warning_label.show()
         else:
             self.disk_warning_label.hide()
-    
+
+    def refresh_signals(self):
+        """Refresh Signals Tab"""
+        self.signal_table.setRowCount(0)
+        files = list(self.signals_dir.glob("*.parquet"))
+        
+        for f in files:
+            try:
+                stat = f.stat()
+                size_kb = stat.st_size / 1024
+                mtime = datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M')
+                
+                # Read metadata (first row) to get asset info
+                meta_df = pd.read_parquet(f).head(1)
+                asset = "Unknown"
+                rows = 0
+                if not meta_df.empty:
+                    if 'symbol' in meta_df.columns:
+                        asset = str(meta_df['symbol'].iloc[0])
+                    # Get quick approximate row count if possible, else skip for speed or use arrow metadata
+                    # For now, let's just use what we have or skip row count if slow. 
+                    # Parquet metadata read is fast.
+                    import pyarrow.parquet as pq
+                    rows = pq.read_metadata(f).num_rows
+                
+                row = self.signal_table.rowCount()
+                self.signal_table.insertRow(row)
+                
+                self.signal_table.setItem(row, 0, QTableWidgetItem(f.name))
+                self.signal_table.setItem(row, 1, QTableWidgetItem(mtime))
+                self.signal_table.setItem(row, 2, QTableWidgetItem(f"{size_kb:.1f}"))
+                self.signal_table.setItem(row, 3, QTableWidgetItem(asset))
+                self.signal_table.setItem(row, 4, QTableWidgetItem(str(rows)))
+                self.signal_table.setItem(row, 5, QTableWidgetItem(str(f.absolute()))) # Hidden col? No, just use user role or similar.
+                
+                # Store full path in user role of first item
+                self.signal_table.item(row, 0).setData(Qt.ItemDataRole.UserRole, str(f.absolute()))
+                
+            except Exception as e:
+                print(f"Error reading signal {f}: {e}")
+
+    def _open_dir(self, path):
+        CacheManager.open_directory_in_explorer(str(path))
+
+    def _on_preview_signal(self):
+        """Preview selected signal"""
+        rows = self.signal_table.selectionModel().selectedRows()
+        if not rows: return
+        
+        path = self.signal_table.item(rows[0].row(), 0).data(Qt.ItemDataRole.UserRole)
+        self._show_preview(path)
+
+    def _on_signal_double_click(self, index):
+        path = self.signal_table.item(index.row(), 0).data(Qt.ItemDataRole.UserRole)
+        self._show_preview(path)
+
+    def _on_delete_signal(self):
+        rows = self.signal_table.selectionModel().selectedRows()
+        if not rows: return
+        
+        reply = QMessageBox.question(self, "Confirm Delete", f"Delete {len(rows)} signals?",
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply == QMessageBox.StandardButton.Yes:
+            for r in rows:
+                path = self.signal_table.item(r.row(), 0).data(Qt.ItemDataRole.UserRole)
+                try:
+                    os.remove(path)
+                except Exception as e:
+                    print(e)
+            self.refresh_signals()
+
+    def _show_preview(self, filepath):
+        try:
+            from .data_preview_dialog import DataPreviewDialog
+            dialog = DataPreviewDialog(filepath, max_rows=20, parent=self)
+            dialog.exec()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
+
+    # --- Existing Event Handlers (Proxied or kept) ---
     def _on_open_master_db_folder(self):
-        """打开Master DB文件夹"""
-        success = CacheManager.open_directory_in_explorer(CacheManager.STORE_DIR)
-        if not success:
-            QMessageBox.warning(self, "错误", "无法打开文件夹！")
+        CacheManager.open_directory_in_explorer(CacheManager.STORE_DIR)
     
     def _on_open_exported_folder(self):
-        """打开导出数据文件夹"""
-        success = CacheManager.open_directory_in_explorer(CacheManager.EXPORTED_DIR)
-        if not success:
-            QMessageBox.warning(self, "错误", "无法打开文件夹！")
+        CacheManager.open_directory_in_explorer(CacheManager.EXPORTED_DIR)
     
     def _on_export_selected(self):
         """导出选中的文件为CSV"""
@@ -282,7 +410,7 @@ class DataManagerDialog(QDialog):
                 fail_count += 1
         
         # 刷新列表
-        self.refresh_data()
+        self.refresh_raw_data()
         
         if fail_count == 0:
             QMessageBox.information(
@@ -327,48 +455,25 @@ class DataManagerDialog(QDialog):
         
         if success:
             QMessageBox.information(self, "清理完成", message)
-            self.refresh_data()
+            self.refresh_raw_data()
         else:
             QMessageBox.critical(self, "清理失败", message)
     
     def _on_preview_selected(self):
         """预览选中的文件"""
         selected_rows = self.table.selectionModel().selectedRows()
-        
         if not selected_rows:
             QMessageBox.information(self, "提示", "请先选择要预览的文件！")
             return
-        
-        # 只预览第一个选中的文件
         row = selected_rows[0].row()
         filepath = self.table.item(row, 5).text()
-        
-        try:
-            from .data_preview_dialog import DataPreviewDialog
-            dialog = DataPreviewDialog(filepath, max_rows=10, parent=self)
-            dialog.exec()
-        except Exception as e:
-            QMessageBox.critical(
-                self,
-                "预览失败",
-                f"无法预览文件：\n\n{str(e)}"
-            )
+        self._show_preview(filepath)
     
     def _on_preview_double_click(self, index):
         """双击表格行预览数据"""
         row = index.row()
         filepath = self.table.item(row, 5).text()
-        
-        try:
-            from .data_preview_dialog import DataPreviewDialog
-            dialog = DataPreviewDialog(filepath, max_rows=10, parent=self)
-            dialog.exec()
-        except Exception as e:
-            QMessageBox.critical(
-                self,
-                "预览失败",
-                f"无法预览文件：\n\n{str(e)}"
-            )
+        self._show_preview(filepath)
     
     def _on_export_all(self):
         """批量导出所有Master DB为CSV"""
