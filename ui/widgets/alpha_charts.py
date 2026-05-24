@@ -321,7 +321,10 @@ class AlphaCharts(QTabWidget):
             if name in ["IC Win Rate", "Turnover", "Coverage"]:
                 val_str = f"{val*100:.1f}%"
             elif name == "Half-Life":
-                val_str = f"{val:.1f}"
+                if val == float('inf'):
+                    val_str = "∞ (极稳定)"
+                else:
+                    val_str = f"{val:.1f}"
                 
             self.stability_table.setItem(i, 1, QTableWidgetItem(val_str))
             

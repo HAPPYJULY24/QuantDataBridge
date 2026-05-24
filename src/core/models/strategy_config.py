@@ -10,6 +10,9 @@ class StrategyMetadata:
     strategy_name: str
     status: str = "ALPHA_DRAFT"
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
+    metrics_schema_version: Optional[str] = None
+    t_stat_method: Optional[str] = None
+    p_value_method: Optional[str] = None
 
 @dataclass
 class EnvironmentConfig:

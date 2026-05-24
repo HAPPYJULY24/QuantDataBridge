@@ -14,9 +14,47 @@ class AlphaEngine:
     """
     Industrial grade Alpha Engine for factor research.
     """
+    METRICS_SCHEMA_VERSION = "alpha_kpi_v2"
+    T_STAT_METHOD = "newey_west"
+    P_VALUE_METHOD = "approx_from_displayed_t_stat"
+    MIN_IC_SAMPLE = 5
+    MIN_UNIQUENESS_RATIO = 0.01  # 1%
+    _session_test_count = 0  # SUPP-01: Class-level session counter for multiple testing awareness
     
     def __init__(self):
         pass
+
+    @staticmethod
+    def _clean_stat_value(value, default=0.0):
+        if value is None or pd.isna(value) or np.isinf(value):
+            return default
+        return float(value)
+
+    @staticmethod
+    def _newey_west_t_stat(series):
+        """Newey-West HAC t-stat with automatic fallback to plain t-stat for short series."""
+        series = pd.Series(series).replace([np.inf, -np.inf], np.nan).dropna()
+        n = len(series)
+        if n <= 2:
+            return 0.0
+        mean_val = series.mean()
+        # P0-1 FIX (CRITICAL-02): For n < 10, NW bandwidth collapses to 0-1 lags,
+        # making the HAC estimator unreliable. Fall back to plain t-stat.
+        gamma_0 = float(np.sum((series - mean_val) ** 2) / n)
+        if n < 10:
+            se_plain = np.sqrt(gamma_0 / n) if gamma_0 > 0 else 0.0
+            return AlphaEngine._clean_stat_value(mean_val / se_plain if se_plain != 0 else 0.0)
+        max_lag = int(np.floor(4 * (n / 100) ** (2 / 9)))
+        x = series - mean_val
+        nw_var = gamma_0
+        for j in range(1, max_lag + 1):
+            gamma_j = float(np.sum(x.iloc[j:].values * x.iloc[:-j].values) / n)
+            weight = 1 - j / (max_lag + 1)
+            nw_var += 2 * weight * gamma_j
+        if nw_var <= 0:
+            return 0.0
+        se_nw = np.sqrt(nw_var / n)
+        return AlphaEngine._clean_stat_value(mean_val / se_nw if se_nw != 0 else 0.0)
         
     def process_pipeline(self, df: pd.DataFrame, expression: str, config: dict, periods: list = [1, 5, 10, 20]):
         """
@@ -32,6 +70,7 @@ class AlphaEngine:
             dict: Result dictionary containing metrics, ic_series, quantile_returns, ic_decay_table etc.
         """
         # 0. Data Preparation
+        AlphaEngine._session_test_count += 1  # SUPP-01: Track session test count
         df = df.copy()
         if 'datetime' in df.columns:
             df['datetime'] = pd.to_datetime(df['datetime'])
@@ -75,6 +114,22 @@ class AlphaEngine:
 
         if bool(config.get('only_overlap', False)) and 'is_overlap' in df.columns:
             df = df[df['is_overlap'] == True].copy()
+
+        # SUPP-03 FIX: Optional universe filter (engine layer only)
+        universe_filter = config.get('universe_filter', {})
+        if universe_filter and 'datetime' in df.columns and 'symbol' in df.columns:
+            min_mktcap = universe_filter.get('min_market_cap')
+            min_volume = universe_filter.get('min_avg_daily_volume')
+            min_listing_days = universe_filter.get('min_listing_days')
+            if min_mktcap and 'market_cap' in df.columns:
+                df = df[df['market_cap'] >= min_mktcap].copy()
+            if min_volume and 'volume' in df.columns:
+                avg_vol = df.groupby('symbol')['volume'].transform('mean')
+                df = df[avg_vol >= min_volume].copy()
+            if min_listing_days and 'listing_days' in df.columns:
+                df = df[df['listing_days'] >= min_listing_days].copy()
+            if len(df) == 0:
+                raise ValueError("Universe filter removed all data. Relax filter criteria.")
         
         # 2. Preprocessing
         df['factor_raw'] = df['factor'] # Keep raw for comparison
@@ -95,8 +150,25 @@ class AlphaEngine:
                 group[target_col] = 0.0
             return group
 
+        def standardize_factor_expanding(df_ts, source_col='factor', target_col='factor'):
+            """HIGH-03 FIX: Expanding-window z-score to avoid look-back bias in TS mode."""
+            df_ts = df_ts.copy()
+            expanding_mean = df_ts[source_col].expanding(min_periods=2).mean()
+            expanding_std = df_ts[source_col].expanding(min_periods=2).std()
+            df_ts[target_col] = (df_ts[source_col] - expanding_mean) / expanding_std
+            # First data point(s) have no std → fill with 0
+            df_ts[target_col] = df_ts[target_col].fillna(0.0)
+            # Handle zero std (constant series in early window)
+            df_ts[target_col] = df_ts[target_col].replace([np.inf, -np.inf], 0.0)
+            return df_ts
+
         def preprocess_group(group):
             group = group.copy()
+            # HIGH-02 FIX: Skip winsorization+standardization for tiny cross-sections
+            # With < 3 assets, MAD/std are statistically meaningless
+            if len(group) < 3:
+                group['factor_winsor'] = group['factor']
+                return group
             # A. Winsorization
             method = config.get('winsor_method', '3-Sigma')
             if method == '3-Sigma':
@@ -121,9 +193,14 @@ class AlphaEngine:
 
         # Apply preprocessing
         if is_panel:
-             df = df.groupby('datetime', group_keys=False).apply(preprocess_group)
+             df = df.groupby('datetime', group_keys=False)[df.columns].apply(preprocess_group)
         else:
-             df = preprocess_group(df)
+             # HIGH-03 FIX: TS mode uses config-switchable standardization method
+             ts_std_method = config.get('ts_standardization_method', 'expanding')
+             df = preprocess_group(df)  # Always: winsorize + full-sample z-score first
+             if ts_std_method == 'expanding':
+                 # Override standardization with expanding window to eliminate look-back bias
+                 df = standardize_factor_expanding(df)
              
         # 3. Neutralization
         risk_factors_raw = config.get('risk_factors', [])
@@ -132,14 +209,34 @@ class AlphaEngine:
         
         ridge_alpha = float(config.get('ridge_alpha', 1.0))
         
+        _neutralized_rows = 0  # MEDIUM-02: Track neutralization coverage
+        _total_rows = 0
+
         if risk_factors:
             def neutralize_group(group):
+                nonlocal _neutralized_rows, _total_rows
                 start_cols = risk_factors
                 # Drop rows where risk factors are nan
                 valid_group = group.dropna(subset=start_cols + ['factor'])
+                _total_rows += len(group)
                 
                 if len(valid_group) > len(start_cols) + 2:
-                    X = valid_group[start_cols].values
+                    _neutralized_rows += len(valid_group)
+                    # P1-4 FIX (HIGH-04+SUPP-02): Winsorize + standardize X
+                    # to match Y's preprocessing and prevent leverage-point contamination.
+                    X_df = valid_group[start_cols].copy()
+                    for col in start_cols:
+                        median = X_df[col].median()
+                        mad = (X_df[col] - median).abs().median()
+                        # Guard: skip clip when MAD=0 (>50% identical values)
+                        # Clipping with limit=0 would collapse column to median
+                        if mad > 1e-6:
+                            limit = 3 * 1.4826 * mad
+                            X_df[col] = X_df[col].clip(lower=median - limit, upper=median + limit)
+                        col_std = X_df[col].std()
+                        if col_std > 0:
+                            X_df[col] = (X_df[col] - X_df[col].mean()) / col_std
+                    X = X_df.values
                     y = valid_group['factor'].values
                     
                     model = Ridge(alpha=ridge_alpha)
@@ -149,16 +246,23 @@ class AlphaEngine:
                     resids = y - preds
                     
                     group.loc[valid_group.index, 'factor'] = resids
+                    # MEDIUM-02 FIX: Mark non-valid rows within this cross-section as NaN
+                    non_valid_idx = group.index.difference(valid_group.index)
+                    if len(non_valid_idx) > 0:
+                        group.loc[non_valid_idx, 'factor'] = np.nan
+                else:
+                    # MEDIUM-02 FIX: Entire cross-section failed neutralization → NaN
+                    group['factor'] = np.nan
                 return group
 
             if is_panel:
-                df = df.groupby('datetime', group_keys=False).apply(neutralize_group)
+                df = df.groupby('datetime', group_keys=False)[df.columns].apply(neutralize_group)
             else:
                 df = neutralize_group(df)
 
             df['factor_neutralized'] = df['factor']
             if is_panel:
-                df = df.groupby('datetime', group_keys=False).apply(standardize_factor_group)
+                df = df.groupby('datetime', group_keys=False)[df.columns].apply(standardize_factor_group)
             else:
                 df = standardize_factor_group(df)
         
@@ -212,37 +316,24 @@ class AlphaEngine:
         primary_ic_series = pd.DataFrame()
         
         def clean_stat_value(value, default=0.0):
-            if value is None or pd.isna(value) or np.isinf(value):
-                return default
-            return float(value)
+            return self._clean_stat_value(value, default)
 
         def calc_ic_period(group, ret_c):
             valid = group[['factor', ret_c]].replace([np.inf, -np.inf], np.nan).dropna()
-            if len(valid) < 2 or valid['factor'].nunique() < 2 or valid[ret_c].nunique() < 2:
-                return pd.Series({'Rank_IC': np.nan, 'IC': np.nan})
+            n = len(valid)
+            # P0-2 FIX (HIGH-05): Raise minimum from 2 to MIN_IC_SAMPLE (5)
+            if n < self.MIN_IC_SAMPLE:
+                return pd.Series({'Rank_IC': np.nan, 'IC': np.nan, 'uniqueness_warning': False})
+            if valid['factor'].nunique() < 2 or valid[ret_c].nunique() < 2:
+                return pd.Series({'Rank_IC': np.nan, 'IC': np.nan, 'uniqueness_warning': False})
+            # P0-2 FIX (SUPP-04): Uniqueness Ratio check for rank ties
+            factor_uniqueness = valid['factor'].nunique() / n
+            if factor_uniqueness < self.MIN_UNIQUENESS_RATIO:
+                return pd.Series({'Rank_IC': np.nan, 'IC': np.nan, 'uniqueness_warning': True})
             spearman = valid['factor'].corr(valid[ret_c], method='spearman')
             pearson = valid['factor'].corr(valid[ret_c], method='pearson')
-            return pd.Series({'Rank_IC': spearman, 'IC': pearson})
+            return pd.Series({'Rank_IC': spearman, 'IC': pearson, 'uniqueness_warning': False})
 
-        def newey_west_t_stat(series):
-            series = pd.Series(series).replace([np.inf, -np.inf], np.nan).dropna()
-            n = len(series)
-            if n <= 2:
-                return 0.0
-            mean_val = series.mean()
-            max_lag = int(np.floor(4 * (n / 100) ** (2 / 9)))
-            x = series - mean_val
-            gamma_0 = float(np.sum(x ** 2) / n)
-            nw_var = gamma_0
-            for j in range(1, max_lag + 1):
-                gamma_j = float(np.sum(x.iloc[j:].values * x.iloc[:-j].values) / n)
-                weight = 1 - j / (max_lag + 1)
-                nw_var += 2 * weight * gamma_j
-            if nw_var <= 0:
-                return 0.0
-            se_nw = np.sqrt(nw_var / n)
-            return clean_stat_value(mean_val / se_nw if se_nw != 0 else 0.0)
-        
         for p in periods:
             ret_col = f'ret_{p}'
             
@@ -261,15 +352,13 @@ class AlphaEngine:
                 continue
                 
             if is_panel:
-                ic_daily = eval_period_df.groupby('datetime').apply(lambda g: calc_ic_period(g, ret_col))
+                ic_daily = eval_period_df.groupby('datetime')[['factor', ret_col]].apply(lambda g: calc_ic_period(g, ret_col))
                 ic_daily = ic_daily.replace([np.inf, -np.inf], np.nan).dropna(subset=['Rank_IC'])
                 rank_ic_mean = ic_daily['Rank_IC'].mean()
                 rank_ic_std = ic_daily['Rank_IC'].std()
                 ic_mean = ic_daily['IC'].mean()
                 n_samples = int(ic_daily['Rank_IC'].count()) # Number of valid IC observations
-                
-                # p-value
-                t_stat = rank_ic_mean / (rank_ic_std / np.sqrt(n_samples)) if rank_ic_std != 0 and n_samples > 1 else 0
+                ic_eval_series = ic_daily['Rank_IC'].dropna()
                 
             else:
                 # Time Series Mode: all displayed IC statistics are based on
@@ -288,7 +377,7 @@ class AlphaEngine:
                 rank_ic_mean = rolling_rank_ic.mean()
                 rank_ic_std = rolling_rank_ic.std()
                 n_samples = int(rolling_rank_ic.count())
-                t_stat = newey_west_t_stat(rolling_rank_ic)
+                ic_eval_series = rolling_rank_ic.dropna()
                 
                 if p == primary_period:
                      # Save primary rolling series for visualization (now truly Rank IC)
@@ -298,7 +387,17 @@ class AlphaEngine:
             rank_ic_mean = clean_stat_value(rank_ic_mean)
             rank_ic_std = clean_stat_value(rank_ic_std)
             icir = rank_ic_mean / rank_ic_std if rank_ic_std != 0 else 0
-            t_stat = clean_stat_value(t_stat)
+            plain_t_stat = rank_ic_mean / (rank_ic_std / np.sqrt(n_samples)) if rank_ic_std != 0 and n_samples > 1 else 0
+            plain_t_stat = clean_stat_value(plain_t_stat)
+            nw_t_stat = clean_stat_value(self._newey_west_t_stat(ic_eval_series))
+            t_stat = nw_t_stat
+            positive_win_rate = clean_stat_value((ic_eval_series > 0).mean() if len(ic_eval_series) > 0 else 0.0)
+            directional_win_rate = 1 - positive_win_rate if rank_ic_mean < 0 else positive_win_rate
+            directional_win_rate = clean_stat_value(directional_win_rate)
+            sample_type = 'cross_sectional_periods' if is_panel else 'rolling_rank_ic_points'
+            raw_obs_n = int(original_row_count)
+            analysis_obs_n = int(len(df))
+            valid_return_obs_n = int(len(eval_period_df))
             # P-Value (Two-tailed)
             p_value = 2 * (1 - t.cdf(abs(t_stat), df=n_samples-1)) if n_samples > 1 else 1.0
             
@@ -307,9 +406,20 @@ class AlphaEngine:
                 'Period': p,
                 'Rank IC': rank_ic_mean,
                 'ICIR': icir,
+                'Positive IC Win Rate': positive_win_rate,
+                'Directional Win Rate': directional_win_rate,
+                'Win Rate': directional_win_rate,
                 'T-Stat': t_stat,
+                'NW T-Stat': nw_t_stat,
+                'Plain T-Stat': plain_t_stat,
                 'P-Value': p_value,
-                'N': n_samples
+                'P-Value Method': self.P_VALUE_METHOD,
+                'T-Stat Method': self.T_STAT_METHOD,
+                'N': n_samples,
+                'Sample Type': sample_type,
+                'Raw Obs N': raw_obs_n,
+                'Analysis Obs N': analysis_obs_n,
+                'Valid Return Obs N': valid_return_obs_n
             })
             
             # Record metrics for Primary Period (Legacy / UI Support)
@@ -317,13 +427,27 @@ class AlphaEngine:
                 metrics['Rank IC_Mean'] = rank_ic_mean
                 metrics['ICIR'] = icir
                 metrics['T-Stat'] = t_stat
-                metrics['Win Rate'] = (ic_daily['Rank_IC'] > 0).mean() if is_panel else ((primary_ic_series['Rank_IC'].dropna() > 0).mean() if not primary_ic_series['Rank_IC'].dropna().empty else 0)
-                # Adjust win rate direction
-                if rank_ic_mean < 0:
-                     metrics['Win Rate'] = 1 - metrics['Win Rate']
+                metrics['NW T-Stat'] = nw_t_stat
+                metrics['Plain T-Stat'] = plain_t_stat
+                metrics['P-Value Method'] = self.P_VALUE_METHOD
+                metrics['T-Stat Method'] = self.T_STAT_METHOD
+                metrics['Positive IC Win Rate'] = positive_win_rate
+                metrics['Directional Win Rate'] = directional_win_rate
+                metrics['Win Rate'] = directional_win_rate
                 
                 if is_panel:
                      primary_ic_series = ic_daily[['Rank_IC']]
+
+                     # CRITICAL-01 FIX: Lookahead bias heuristic detection
+                     ic_abs_values = ic_daily['Rank_IC'].abs()
+                     extreme_ic_ratio = float((ic_abs_values > 0.5).mean())
+                     median_abs_ic = float(ic_abs_values.median()) if len(ic_abs_values) > 0 else 0.0
+                     if median_abs_ic > 0.5 or extreme_ic_ratio > 0.3:
+                         metrics['_lookahead_warning'] = (
+                             f"WARNING: Median |Rank IC| = {median_abs_ic:.3f}, "
+                             f"{extreme_ic_ratio:.0%} of cross-sections have |IC| > 0.5. "
+                             f"This may indicate lookahead bias in the factor expression."
+                         )
         
         # Aggregate Decay Table
         ic_decay_df = pd.DataFrame(ic_decay_stats).set_index('Period') if ic_decay_stats else pd.DataFrame()
@@ -356,7 +480,7 @@ class AlphaEngine:
                     return pd.Series()
 
             if is_panel:
-                 q_daily = eval_q_df.groupby('datetime').apply(quintile_ret).unstack(level=-1)
+                 q_daily = eval_q_df.groupby('datetime')[['factor', ret_col_primary]].apply(quintile_ret).unstack(level=-1)
                  quantile_returns = q_daily.mean()
                  # Use geometric compounding for discrete returns, not arithmetic cumsum
                  quantile_cum_ret = q_daily.add(1).cumprod() - 1
@@ -390,6 +514,12 @@ class AlphaEngine:
                 risk_correlation_matrix = self.analyze_correlation(risk_df, 'factor', risk_factors)
 
         return {
+            'metrics_schema_version': self.METRICS_SCHEMA_VERSION,
+            'metadata': {
+                'metrics_schema_version': self.METRICS_SCHEMA_VERSION,
+                't_stat_method': self.T_STAT_METHOD,
+                'p_value_method': self.P_VALUE_METHOD,
+            },
             'metrics': metrics,
             'ic_series': primary_ic_series,
             'quantile_returns': quantile_returns,
@@ -407,18 +537,28 @@ class AlphaEngine:
                 'factor_coverage': factor_valid_count / original_row_count if original_row_count > 0 else 0.0,
                 'analysis_rows': len(df),
                 'return_valid_rows': int(df[ret_col_primary].notna().sum()) if ret_col_primary and ret_col_primary in df.columns else 0,
+                # MEDIUM-02 FIX: Neutralization coverage tracking
+                'neutralization_coverage': _neutralized_rows / _total_rows if _total_rows > 0 else 1.0,
             },
+            # SUPP-01 FIX: Multiple testing session awareness
+            'session_test_count': AlphaEngine._session_test_count,
+            'multiple_testing_warning': (
+                f"Session has tested {AlphaEngine._session_test_count} expressions. "
+                f"Expected false positives at P<0.05: ~{AlphaEngine._session_test_count * 0.05:.1f}"
+            ) if AlphaEngine._session_test_count > 20 else None,
             # New: Professional Metrics
+            # P0-3 FIX (HIGH-01): Pass is_panel to avoid re-detection on filtered data
             'professional_metrics': self.calculate_professional_metrics(
                 df, 'factor', ret_col_primary,
                 coverage_context={
                     'raw_rows': original_row_count,
                     'factor_valid_rows': factor_valid_count,
-                }
+                },
+                is_panel=is_panel
             ) if ret_col_primary else {}
         }
 
-    def calculate_professional_metrics(self, df: pd.DataFrame, factor_name: str, returns_name: str, coverage_context: dict = None) -> dict:
+    def calculate_professional_metrics(self, df: pd.DataFrame, factor_name: str, returns_name: str, coverage_context: dict = None, is_panel: bool = None) -> dict:
         """
         Calculate statistical confidence, execution reality, and breadth metrics.
         
@@ -426,6 +566,9 @@ class AlphaEngine:
             df (pd.DataFrame): Data with factor and returns.
             factor_name (str): Column name for the factor.
             returns_name (str): Column name for the returns (e.g., 'ret_1').
+            coverage_context (dict): Optional context with raw/valid row counts.
+            is_panel (bool): If provided, use this mode directly (P0-3 FIX HIGH-01).
+                             If None, auto-detect from data (backward compatible).
             
         Returns:
             dict: Dictionary containing professional metrics.
@@ -441,36 +584,17 @@ class AlphaEngine:
 
         # 1. Statistical Confidence
         # -------------------------
-        # Check Panel vs Time-Series Mode
-        is_panel = False
-        if 'datetime' in valid_df.columns:
-            avg_obs = valid_df.groupby('datetime').size().mean()
-            if avg_obs > 1.5:
-                is_panel = True
+        # P0-3 FIX (HIGH-01): Use passed is_panel to avoid re-detection inconsistency.
+        # Fallback to auto-detection only when is_panel is not explicitly provided.
+        if is_panel is None:
+            is_panel = False
+            if 'datetime' in valid_df.columns:
+                avg_obs = valid_df.groupby('datetime').size().mean()
+                if avg_obs > 1.5:
+                    is_panel = True
 
         def clean_metric(value, default=0.0):
-            if value is None or pd.isna(value) or np.isinf(value):
-                return default
-            return float(value)
-
-        def newey_west_t_stat(series):
-            series = pd.Series(series).replace([np.inf, -np.inf], np.nan).dropna()
-            n = len(series)
-            if n <= 2:
-                return 0.0
-            mean_val = series.mean()
-            max_lag = int(np.floor(4 * (n / 100) ** (2 / 9)))
-            x = series - mean_val
-            gamma_0 = float(np.sum(x ** 2) / n)
-            nw_var = gamma_0
-            for j in range(1, max_lag + 1):
-                gamma_j = float(np.sum(x.iloc[j:].values * x.iloc[:-j].values) / n)
-                weight = 1 - j / (max_lag + 1)
-                nw_var += 2 * weight * gamma_j
-            if nw_var <= 0:
-                return 0.0
-            se_nw = np.sqrt(nw_var / n)
-            return clean_metric(mean_val / se_nw if se_nw != 0 else 0.0)
+            return self._clean_stat_value(value, default)
 
         # IC Analysis
         if is_panel:
@@ -494,7 +618,9 @@ class AlphaEngine:
             rank_ic_std = daily_stats['Rank_IC'].std()
             
             n_samples = int(len(daily_stats))
-            t_stat = ic_mean / (ic_std / np.sqrt(n_samples)) if ic_std != 0 and n_samples > 1 else 0
+            plain_t_stat = rank_ic_mean / (rank_ic_std / np.sqrt(n_samples)) if rank_ic_std != 0 and n_samples > 1 else 0
+            nw_t_stat = self._newey_west_t_stat(daily_stats['Rank_IC'])
+            t_stat = nw_t_stat
         else:
             # Time-Series IC: use global correlations as levels and
             # Newey-West t-stat over the standardized IC proxy.
@@ -508,8 +634,6 @@ class AlphaEngine:
             r_norm = (valid_df[returns_name] - valid_df[returns_name].mean()) / valid_df[returns_name].std()
             ic_series_ts = (f_norm * r_norm).dropna()
             
-            n_samples = len(ic_series_ts)
-            t_stat = newey_west_t_stat(ic_series_ts)
             ic_std = ic_series_ts.std()
             ic_mean = global_ic_mean
             
@@ -520,6 +644,10 @@ class AlphaEngine:
             rolling_rank_ic = rolling_rank_ic.replace([np.inf, -np.inf], np.nan).dropna()
             rank_ic_mean = rolling_rank_ic.mean()
             rank_ic_std = rolling_rank_ic.std()
+            n_samples = int(len(rolling_rank_ic))
+            plain_t_stat = rank_ic_mean / (rank_ic_std / np.sqrt(n_samples)) if rank_ic_std != 0 and n_samples > 1 else 0
+            nw_t_stat = self._newey_west_t_stat(rolling_rank_ic)
+            t_stat = nw_t_stat
 
         # IC IR
         metrics['ic_mean'] = clean_metric(ic_mean)
@@ -532,6 +660,9 @@ class AlphaEngine:
         
         # T-Stat
         metrics['t_stat'] = clean_metric(t_stat)
+        metrics['nw_t_stat'] = clean_metric(nw_t_stat)
+        metrics['plain_t_stat'] = clean_metric(plain_t_stat)
+        metrics['t_stat_method'] = 'newey_west'
         
         # IC Win Rate (Consistency)
         if is_panel:
@@ -601,12 +732,21 @@ class AlphaEngine:
         else:
             metrics['quantile_turnover'] = 0.0 # TS mode turnover undefined without portfolio construction
             
-        # Half-Life
-        # HL = -ln(2) / ln(AutoCorr)
+        # Half-Life: HL = -ln(2) / ln(AC)
+        # CRITICAL-03 FIX: Distinguish three AC regimes with distinct semantics
         if 0 < autocorr < 1:
             metrics['half_life'] = -np.log(2) / np.log(autocorr)
+        elif autocorr >= 1:
+            # AC >= 1: Signal is extremely stable (never decays)
+            metrics['half_life'] = float('inf')
         else:
-            metrics['half_life'] = 0 # Immediate decay or unstable
+            # AC <= 0: Signal is anti-persistent or oscillating → immediate decay
+            metrics['half_life'] = 0.0
+        metrics['autocorr_regime'] = (
+            'stable' if autocorr >= 1
+            else 'normal_decay' if 0 < autocorr < 1
+            else 'anti_persistent'
+        )
             
         # 3. Investment Breadth
         # ---------------------
@@ -629,12 +769,15 @@ class AlphaEngine:
         return df[target_cols].corr(method='spearman')
 
     @staticmethod
-    def prepare_signal_export(df: pd.DataFrame) -> pd.DataFrame:
+    def prepare_signal_export(df: pd.DataFrame) -> tuple:
         """
         Prepare DataFrame for export to Backtest Engine / Risk Control.
         1. Normalize Columns (lower case, handle specific naming conventions).
         2. Validate Required Columns (close, factor).
         3. Cleans invalid factor rows.
+
+        Returns:
+            tuple: (clean_df, audit_info) where audit_info is a dict with drop statistics.
         """
         df = df.copy()
         
@@ -675,11 +818,23 @@ class AlphaEngine:
         # Ensure datetime
         if 'datetime' in df.columns:
             df['datetime'] = pd.to_datetime(df['datetime'])
+
+        # HIGH-06 FIX: Audit logging before dropna
+        pre_clean_rows = len(df)
+        dropped_factor_nan = int(df['factor'].isna().sum())
+        dropped_close_nan = int(df['close'].isna().sum())
             
         # 3. Clean Data
         # Drop rows where factor/close is NaN or infinite.
         df = df.replace([np.inf, -np.inf], np.nan)
         df_clean = df.dropna(subset=['factor', 'close']).copy()
+
+        audit_info = {
+            'export_pre_clean_rows': pre_clean_rows,
+            'export_dropped_factor_nan': dropped_factor_nan,
+            'export_dropped_close_nan': dropped_close_nan,
+            'export_clean_rows': len(df_clean),
+        }
         
         # 4. Select Final Columns
         target_cols = ['datetime', 'symbol', 'open', 'high', 'low', 'close', 'volume', 'factor']
@@ -690,4 +845,39 @@ class AlphaEngine:
         
         # Additional custom columns present from original data can be kept or dropped.
         # Keeping only structured data for strict backtest ingestion.
-        return df_clean[final_cols]
+        return df_clean[final_cols], audit_info
+
+    @classmethod
+    def build_metrics_export_metadata(cls, result: dict | None = None) -> dict:
+        """
+        Build portable string metadata for exported Alpha signal files.
+        """
+        result = result or {}
+        result_meta = result.get('metadata', {}) if isinstance(result, dict) else {}
+        return {
+            'metrics_schema_version': (
+                result.get('metrics_schema_version')
+                or result_meta.get('metrics_schema_version')
+                or cls.METRICS_SCHEMA_VERSION
+            ),
+            't_stat_method': result_meta.get('t_stat_method') or cls.T_STAT_METHOD,
+            'p_value_method': result_meta.get('p_value_method') or cls.P_VALUE_METHOD,
+        }
+
+    @staticmethod
+    def write_signal_export_parquet(df: pd.DataFrame, filepath, metadata: dict | None = None) -> None:
+        """
+        Write an Alpha signal parquet file with key-value metadata preserved in
+        the parquet schema for downstream Backtest/Risk modules.
+        """
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        table = pa.Table.from_pandas(df, preserve_index=False)
+        schema_metadata = dict(table.schema.metadata or {})
+        for key, value in (metadata or {}).items():
+            if value is None:
+                continue
+            schema_metadata[str(key).encode('utf-8')] = str(value).encode('utf-8')
+        table = table.replace_schema_metadata(schema_metadata)
+        pq.write_table(table, filepath)

@@ -1,0 +1,147 @@
+"""
+Settings Dialog - 应用设置对话框
+
+Provides language selection and other application preferences.
+"""
+
+from PyQt6.QtWidgets import (
+    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
+    QPushButton, QGroupBox, QMessageBox
+)
+from PyQt6.QtCore import Qt
+from logic.localization import tr, set_language, get_current_language, get_available_languages
+
+
+class SettingsDialog(QDialog):
+    """应用设置对话框"""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(tr("settings.title"))
+        self.setMinimumWidth(500)
+        self.setModal(True)
+        
+        # 存储初始语言
+        self.initial_language = get_current_language()
+        self.language_changed = False
+        
+        self._init_ui()
+    
+    def _init_ui(self):
+        """初始化界面"""
+        layout = QVBoxLayout()
+        
+        # === 语言设置组 ===
+        language_group = QGroupBox(tr("settings.language"))
+        language_layout = QVBoxLayout()
+        
+        # 语言选择行
+        lang_row = QHBoxLayout()
+        lang_label = QLabel(tr("settings.language_label"))
+        lang_row.addWidget(lang_label)
+        
+        # 语言下拉框
+        self.language_combo = QComboBox()
+        available_langs = get_available_languages()
+        
+        for lang_code, lang_name in available_langs.items():
+            self.language_combo.addItem(lang_name, lang_code)
+        
+        # 设置当前语言
+        current_lang = get_current_language()
+        index = self.language_combo.findData(current_lang)
+        if index >= 0:
+            self.language_combo.setCurrentIndex(index)
+        
+        self.language_combo.currentIndexChanged.connect(self._on_language_changed)
+        lang_row.addWidget(self.language_combo)
+        lang_row.addStretch()
+        
+        language_layout.addLayout(lang_row)
+        
+        # 重启提示标签
+        self.restart_label = QLabel(tr("settings.restart_required"))
+        self.restart_label.setStyleSheet("""
+            QLabel {
+                color: #ff9800;
+                padding: 8px;
+                background-color: #fff3e0;
+                border-radius: 4px;
+                font-weight: bold;
+            }
+        """)
+        self.restart_label.setVisible(False)
+        language_layout.addWidget(self.restart_label)
+        
+        language_group.setLayout(language_layout)
+        layout.addWidget(language_group)
+        
+        layout.addStretch()
+        
+        # === 按钮区 ===
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+        
+        cancel_btn = QPushButton(tr("settings.cancel"))
+        cancel_btn.clicked.connect(self.reject)
+        button_layout.addWidget(cancel_btn)
+        
+        save_btn = QPushButton(tr("settings.save"))
+        save_btn.setDefault(True)
+        save_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                padding: 8px 16px;
+                border: none;
+                border-radius: 4px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #45a049;
+            }
+        """)
+        save_btn.clicked.connect(self._save_settings)
+        button_layout.addWidget(save_btn)
+        
+        layout.addLayout(button_layout)
+        self.setLayout(layout)
+    
+    def _on_language_changed(self):
+        """语言选择改变时"""
+        selected_lang = self.language_combo.currentData()
+        if selected_lang != self.initial_language:
+            self.language_changed = True
+            self.restart_label.setVisible(True)
+        else:
+            self.language_changed = False
+            self.restart_label.setVisible(False)
+    
+    def _save_settings(self):
+        """保存设置"""
+        if self.language_changed:
+            # 保存语言设置
+            selected_lang = self.language_combo.currentData()
+            set_language(selected_lang)
+            
+            # 询问是否重启
+            reply = QMessageBox.question(
+                self,
+                tr("settings.restart_title"),
+                tr("settings.restart_message"),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes
+            )
+            
+            if reply == QMessageBox.StandardButton.Yes:
+                # 用户选择重启
+                self.accept()
+                # 通知主窗口需要重启
+                if self.parent():
+                    self.parent()._restart_application()
+            else:
+                # 用户选择稍后重启
+                self.accept()
+        else:
+            # 无变化，直接关闭
+            self.accept()

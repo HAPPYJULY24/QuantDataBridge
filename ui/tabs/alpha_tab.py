@@ -186,6 +186,17 @@ class AlphaTab(QWidget):
         self.init_ui()
         self.current_worker = None
         self.current_result = None # Store result for export
+
+    @staticmethod
+    def _clean_strategy_path_part(value):
+        cleaned = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in str(value).strip())
+        return cleaned.strip("_") or "strategy"
+
+    @classmethod
+    def _build_strategy_package_folder_name(cls, strategy_id, strategy_name):
+        safe_stg_id = cls._clean_strategy_path_part(strategy_id)
+        safe_stg_name = cls._clean_strategy_path_part(strategy_name)
+        return safe_stg_id if safe_stg_id.casefold() == safe_stg_name.casefold() else f"{safe_stg_id}_{safe_stg_name}"
         
     def init_ui(self):
         main_layout = QHBoxLayout()
@@ -716,6 +727,16 @@ class AlphaTab(QWidget):
         self._log("Processing complete. Rendering charts (This may take a moment)...")
         self.current_result = result
         self._log(f"Target return column used: {result.get('target_return_col', 'N/A')}")
+        
+        # Log lookahead warning or multiple testing warning if present
+        multiple_testing_warning = result.get('multiple_testing_warning')
+        if multiple_testing_warning:
+            self._log(f"WARNING: {multiple_testing_warning}")
+            
+        metrics_v1 = result.get('metrics', {})
+        lookahead_warning = metrics_v1.get('_lookahead_warning')
+        if lookahead_warning:
+            self._log(f"WARNING: {lookahead_warning}")
 
         ic_decay = result.get('ic_decay_table', pd.DataFrame())
         self.period_combo.blockSignals(True)
@@ -764,6 +785,16 @@ class AlphaTab(QWidget):
         self.metrics_table = QTableWidget()
         self.metrics_table.setColumnCount(4)
         self.metrics_table.setHorizontalHeaderLabels(["Metric", "Value", "Description", "Rating"])
+        header_tooltips = [
+            "KPI name. Hover each row for the metric definition and calculation scope.",
+            "Displayed KPI value for the currently selected period.",
+            "Short interpretation used by the Metrics KPI table.",
+            "Heuristic status label for quick review; use the tooltip and raw value for research decisions.",
+        ]
+        for col, tooltip in enumerate(header_tooltips):
+            header_item = self.metrics_table.horizontalHeaderItem(col)
+            if header_item:
+                header_item.setToolTip(tooltip)
         self.metrics_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.metrics_table.verticalHeader().setVisible(False)
         self.metrics_table.setAlternatingRowColors(True)
@@ -783,6 +814,13 @@ class AlphaTab(QWidget):
         
         ic_decay = self.current_result.get('ic_decay_table', pd.DataFrame())
         metrics_v1 = self.current_result.get('metrics', {})
+        expected_schema = getattr(AlphaEngine, 'METRICS_SCHEMA_VERSION', 'alpha_kpi_v2')
+        schema_version = self.current_result.get('metrics_schema_version') or self.current_result.get('metadata', {}).get('metrics_schema_version')
+        required_schema_cols = {
+            'Win Rate', 'Positive IC Win Rate', 'Directional Win Rate',
+            'NW T-Stat', 'Plain T-Stat', 'T-Stat Method', 'P-Value Method',
+            'Sample Type', 'Raw Obs N', 'Analysis Obs N', 'Valid Return Obs N'
+        }
         
         # Populate period combo if empty
         if self.period_combo.count() == 0 and not ic_decay.empty:
@@ -795,20 +833,123 @@ class AlphaTab(QWidget):
              
         # Prepare Rows
         rows = []
+        row_data_for_tooltips = None
+        selected_period_for_tooltips = current_p_text or "current"
+
+        def metric_tooltip(metric, meta=None, row_data=None):
+            period_text = selected_period_for_tooltips
+            schema_text = schema_version or "legacy/unknown"
+
+            if metric == 'Schema Warning':
+                return (
+                    f"{meta}\n\n"
+                    "This result does not fully match the current Metrics KPI schema. "
+                    "Rerun the Alpha pipeline to regenerate period-specific KPI fields."
+                )
+            if metric == 'Rank IC Mean':
+                return (
+                    f"Period: {period_text}\nSchema: {schema_text}\n\n"
+                    "Mean Spearman Rank IC between the factor and the selected forward return. "
+                    "Panel mode averages cross-sectional IC values by datetime; time-series mode "
+                    "uses the rolling Rank IC sequence."
+                )
+            if metric == 'ICIR':
+                return (
+                    f"Period: {period_text}\n\n"
+                    "Information coefficient information ratio: Rank IC Mean divided by the "
+                    "standard deviation of the same Rank IC sequence."
+                )
+            if metric == 'Win Rate':
+                return (
+                    f"Period: {period_text}\n\n"
+                    "Direction-adjusted consistency for the current period. It equals Directional "
+                    "Win Rate and is read from the selected ic_decay_table row, not legacy primary "
+                    "period metrics."
+                )
+            if metric == 'Positive IC Win Rate':
+                return (
+                    f"Period: {period_text}\n\n"
+                    "Raw share of Rank IC observations greater than zero. This value is not flipped "
+                    "for negative-direction factors."
+                )
+            if metric == 'Directional Win Rate':
+                return (
+                    f"Period: {period_text}\n\n"
+                    "Direction-adjusted share of IC observations aligned with the factor direction. "
+                    "If Rank IC Mean is negative, this is 1 - Positive IC Win Rate."
+                )
+            if metric == 'T-Stat':
+                method_text = meta or "displayed_t_stat"
+                return (
+                    f"Period: {period_text}\nMethod: {method_text}\n\n"
+                    "Displayed T-Stat for the current Rank IC sequence. In the current schema this "
+                    "is the Newey-West robust t-stat and should be interpreted together with Sample N."
+                )
+            if metric == 'Plain T-Stat':
+                return (
+                    f"Period: {period_text}\n\n"
+                    "Ordinary t-stat over the current Rank IC sequence. Kept as a reference so "
+                    "researchers can compare it with the main Newey-West robust T-Stat."
+                )
+            if metric == 'P-Value':
+                method_text = meta or "current_displayed_t_stat"
+                return (
+                    f"Period: {period_text}\nMethod: {method_text}\n\n"
+                    "Approximate significance indicator based on the displayed T-Stat. For "
+                    "Newey-West robust T-Stat, interpret this conservatively and use |T-Stat|, "
+                    "Sample N, and Sample Type together."
+                )
+            if metric == 'Sample N':
+                sample_type = meta or "valid_ic_observations"
+                sample_note = {
+                    'cross_sectional_periods': "valid cross-sectional IC periods",
+                    'rolling_rank_ic_points': "valid rolling Rank IC points",
+                }.get(sample_type, "valid IC observations")
+                obs_parts = []
+                if row_data is not None:
+                    for label, key in [
+                        ("Raw rows", "Raw Obs N"),
+                        ("Analysis rows", "Analysis Obs N"),
+                        ("Valid return rows", "Valid Return Obs N"),
+                    ]:
+                        obs_value = row_data.get(key, None)
+                        if obs_value is not None and not pd.isna(obs_value):
+                            obs_parts.append(f"{label}: {int(obs_value)}")
+                obs_text = ("\n" + "\n".join(obs_parts)) if obs_parts else ""
+                return (
+                    f"Period: {period_text}\nSample Type: {sample_type}\n\n"
+                    f"Sample N means {sample_note}. It is not necessarily equal to the raw data "
+                    f"row count; compare it with the observation counts below.{obs_text}"
+                )
+            return f"Period: {period_text}\nSchema: {schema_text}\n\nCurrent Metrics KPI value."
         
         if current_p_text and not ic_decay.empty:
             try:
                 period = int(current_p_text)
                 row_data = ic_decay.loc[period]
+                row_data_for_tooltips = row_data
+                selected_period_for_tooltips = str(period)
+                sample_type = row_data.get('Sample Type', '')
+                missing_schema_cols = sorted(required_schema_cols.difference(set(ic_decay.columns)))
+                if schema_version != expected_schema or missing_schema_cols:
+                    missing_text = ", ".join(missing_schema_cols[:4])
+                    if len(missing_schema_cols) > 4:
+                        missing_text += ", ..."
+                    warning_detail = (
+                        f"Expected {expected_schema}; found {schema_version or 'unknown'}"
+                        + (f"; missing {missing_text}" if missing_schema_cols else "")
+                    )
+                    rows.append(('Schema Warning', warning_detail))
                 
                 rows.append(('Rank IC Mean', row_data['Rank IC']))
                 rows.append(('ICIR', row_data['ICIR']))
-                rows.append(('T-Stat', row_data['T-Stat']))
-                rows.append(('P-Value', row_data['P-Value']))
-                rows.append(('Sample N', row_data['N']))
-                
-                if metrics_v1:
-                     rows.insert(2, ('Win Rate', metrics_v1.get('Win Rate', 0)))
+                rows.append(('Win Rate', row_data.get('Win Rate', np.nan)))
+                rows.append(('Positive IC Win Rate', row_data.get('Positive IC Win Rate', np.nan)))
+                rows.append(('Directional Win Rate', row_data.get('Directional Win Rate', row_data.get('Win Rate', np.nan))))
+                rows.append(('T-Stat', row_data['T-Stat'], row_data.get('T-Stat Method', '')))
+                rows.append(('Plain T-Stat', row_data.get('Plain T-Stat', np.nan)))
+                rows.append(('P-Value', row_data['P-Value'], row_data.get('P-Value Method', '')))
+                rows.append(('Sample N', row_data['N'], sample_type))
 
             except Exception as e:
                 self._log(f"Error parse metrics: {e}")
@@ -818,20 +959,31 @@ class AlphaTab(QWidget):
                 
         self.metrics_table.setRowCount(len(rows))
         
-        for i, (k, v) in enumerate(rows):
-            self.metrics_table.setItem(i, 0, QTableWidgetItem(k))
+        for i, row in enumerate(rows):
+            k, v = row[0], row[1]
+            row_meta = row[2] if len(row) > 2 else None
+            tooltip_meta = v if k == 'Schema Warning' else row_meta
+            tooltip = metric_tooltip(k, tooltip_meta, row_data_for_tooltips)
+
+            metric_item = QTableWidgetItem(k)
+            metric_item.setToolTip(tooltip)
+            self.metrics_table.setItem(i, 0, metric_item)
             
             # Value Formatting
             if pd.isna(v):
                 value_str = "N/A"
+            elif isinstance(v, str):
+                value_str = v
             else:
-                if k == 'Win Rate': value_str = f"{v*100:.1f}%"
-                elif k == 'T-Stat': value_str = f"{v:.2f}"
+                if 'Win Rate' in k: value_str = f"{v*100:.1f}%"
+                elif k in ['T-Stat', 'NW T-Stat', 'Plain T-Stat']: value_str = f"{v:.2f}"
                 elif k == 'Sample N': value_str = f"{int(v)}"
                 elif k == 'P-Value': value_str = f"{v:.4e}" if v < 0.001 else f"{v:.4f}"
                 else: value_str = f"{v:.4f}"
             
-            self.metrics_table.setItem(i, 1, QTableWidgetItem(value_str))
+            value_item = QTableWidgetItem(value_str)
+            value_item.setToolTip(tooltip)
+            self.metrics_table.setItem(i, 1, value_item)
             
             # Description Logic
             description = ""
@@ -854,27 +1006,81 @@ class AlphaTab(QWidget):
                 elif abs(v) > 0.5:
                     description = "Stable"
             elif k == 'P-Value':
+                description = "Approx. significance indicator" if row_meta == 'approx_from_displayed_t_stat' else ""
                 if v < 0.05:
-                    description = "Significant (<0.05)"
                     rating = "Pass"
                     bg_color = QColor(50, 100, 50)
                 else:
-                    description = "Not Significant"
+                    if not description:
+                        description = "Not Significant"
                     text_color = QColor("gray")
             elif k == 'Win Rate':
+                description = "Direction-adjusted consistency"
                 if v > 0.55:
-                    description = "Consistent"
                     rating = "Good"
                     bg_color = QColor(50, 100, 50)
                 elif v > 0.45:
-                    description = "Average"
+                    description = "Direction-adjusted average"
                 else:
-                    description = "Unstable"
+                    description = "Direction-adjusted unstable"
                     text_color = QColor("#FF9800")
+            elif k == 'Directional Win Rate':
+                description = "Direction-adjusted consistency"
+                if v > 0.55:
+                    rating = "Good"
+                    bg_color = QColor(50, 100, 50)
+                elif v > 0.45:
+                    description = "Direction-adjusted average"
+                else:
+                    description = "Direction-adjusted unstable"
+                    text_color = QColor("#FF9800")
+            elif k == 'Positive IC Win Rate':
+                description = "Raw share of positive Rank IC"
+            elif k == 'T-Stat':
+                method_label = "Newey-West robust" if row_meta == 'newey_west' else "Displayed"
+                if abs(v) >= 2.0:
+                    description = f"{method_label} significant"
+                    rating = "Pass"
+                    bg_color = QColor(50, 100, 50)
+                elif abs(v) >= 1.65:
+                    description = f"{method_label} marginal"
+                    rating = "Watch"
+                    text_color = QColor("#FF9800")
+                else:
+                    description = f"{method_label} insignificant"
+                    rating = "Weak"
+                    text_color = QColor("gray")
+            elif k == 'Plain T-Stat':
+                description = "Reference only"
+            elif k == 'Sample N':
+                if row_meta == 'cross_sectional_periods':
+                    description = "Valid cross-sectional IC periods"
+                elif row_meta == 'rolling_rank_ic_points':
+                    description = "Valid rolling Rank IC points"
+                else:
+                    description = "Valid IC observations"
+                if v >= 60:
+                    rating = "Good"
+                    description += " (heuristic)"
+                elif v >= 30:
+                    rating = "Watch"
+                    description += " (limited)"
+                    text_color = QColor("#FF9800")
+                else:
+                    rating = "Weak"
+                    description += " (small sample)"
+                    text_color = QColor("gray")
+            elif k == 'Schema Warning':
+                description = "Legacy metrics schema; rerun Alpha pipeline"
+                rating = "Review"
+                text_color = QColor("#FF9800")
             
-            self.metrics_table.setItem(i, 2, QTableWidgetItem(description))
+            description_item = QTableWidgetItem(description)
+            description_item.setToolTip(tooltip)
+            self.metrics_table.setItem(i, 2, description_item)
             
             rating_item = QTableWidgetItem(rating)
+            rating_item.setToolTip(tooltip)
             if bg_color:
                 rating_item.setBackground(bg_color)
                 rating_item.setForeground(QColor("white"))
@@ -926,15 +1132,27 @@ class AlphaTab(QWidget):
             if not local_dir_path:
                 return
 
-        folder_name = f"{stg_id}_{stg_name}"
-        parquet_filename = f"{stg_id}_data.parquet"
-        json_filename = f"{stg_id}_config.json"
+        safe_stg_id = self._clean_strategy_path_part(stg_id)
+        folder_name = self._build_strategy_package_folder_name(stg_id, stg_name)
+        parquet_filename = f"{safe_stg_id}_data.parquet"
+        json_filename = f"{safe_stg_id}_config.json"
         
         try:
             # 1. 导出 Parquet 信号文件
-            save_df = AlphaEngine.prepare_signal_export(df)
+            save_df, export_audit = AlphaEngine.prepare_signal_export(df)
             if save_df.empty:
                 raise ValueError("Resulting signal is empty after dropping warm-up period.")
+            
+            # Log export audit details to the log panel
+            self._log(
+                f"Export signal pre-clean rows: {export_audit.get('export_pre_clean_rows', 0)}, "
+                f"clean rows: {export_audit.get('export_clean_rows', 0)} "
+                f"(Dropped: {export_audit.get('export_dropped_factor_nan', 0)} Factor NaNs, "
+                f"{export_audit.get('export_dropped_close_nan', 0)} Close NaNs)"
+            )
+            
+            export_metadata = AlphaEngine.build_metrics_export_metadata(self.current_result)
+            export_metadata.update(export_audit)  # HIGH-06: Include audit info in parquet metadata
             
             # 2. 收集环境与流水线上下文
             universe = "unknown"
@@ -955,7 +1173,13 @@ class AlphaTab(QWidget):
             from src.core.models.strategy_config import StrategyConfig, StrategyMetadata, EnvironmentConfig, AlphaPipelineConfig
             
             stg_config = StrategyConfig(
-                metadata=StrategyMetadata(strategy_id=stg_id, strategy_name=stg_name),
+                metadata=StrategyMetadata(
+                    strategy_id=stg_id,
+                    strategy_name=stg_name,
+                    metrics_schema_version=export_metadata.get('metrics_schema_version'),
+                    t_stat_method=export_metadata.get('t_stat_method'),
+                    p_value_method=export_metadata.get('p_value_method')
+                ),
                 environment_config=EnvironmentConfig(universe=universe, timeframe=timeframe),
                 alpha_pipeline=AlphaPipelineConfig(
                     expression=expr,
@@ -975,7 +1199,7 @@ class AlphaTab(QWidget):
             if save_mode in ['data_center', 'both']:
                 dc_base = Path("DataCenter/Alpha_data") / folder_name
                 dc_base.mkdir(parents=True, exist_ok=True)
-                save_df.to_parquet(dc_base / parquet_filename, index=False)
+                AlphaEngine.write_signal_export_parquet(save_df, dc_base / parquet_filename, export_metadata)
                 stg_config.to_json(str(dc_base / json_filename))
                 paths_created.append(f"Data Center (Alpha):\n- {dc_base / parquet_filename}")
                 
@@ -983,7 +1207,7 @@ class AlphaTab(QWidget):
             if save_mode in ['local', 'both']:
                 local_base = Path(local_dir_path) / folder_name
                 local_base.mkdir(parents=True, exist_ok=True)
-                save_df.to_parquet(local_base / parquet_filename, index=False)
+                AlphaEngine.write_signal_export_parquet(save_df, local_base / parquet_filename, export_metadata)
                 stg_config.to_json(str(local_base / json_filename))
                 paths_created.append(f"Local:\n- {local_base / parquet_filename}")
             
@@ -1016,8 +1240,22 @@ class AlphaTab(QWidget):
             return
             
         try:
-            export_df = AlphaEngine.prepare_signal_export(df)
-            export_df.to_parquet(file_path, index=False)
-            QMessageBox.information(self, "Export Success", f"Signal exported to:\n{file_path}\nRows: {len(export_df)}\nFormat: Parquet")
+            export_df, export_audit = AlphaEngine.prepare_signal_export(df)
+            export_metadata = AlphaEngine.build_metrics_export_metadata(self.current_result)
+            export_metadata.update(export_audit)  # HIGH-06: Include audit info in parquet metadata
+            AlphaEngine.write_signal_export_parquet(export_df, file_path, export_metadata)
+            
+            dropped_msg = ""
+            if export_audit:
+                f_nan = export_audit.get('export_dropped_factor_nan', 0)
+                c_nan = export_audit.get('export_dropped_close_nan', 0)
+                if f_nan > 0 or c_nan > 0:
+                    dropped_msg = f"\n(Cleaned: {f_nan} Factor NaNs, {c_nan} Close NaNs)"
+            QMessageBox.information(
+                self, "Export Success",
+                f"Signal exported to:\n{file_path}\n"
+                f"Rows: {len(export_df)}{dropped_msg}\n"
+                f"Format: Parquet"
+            )
         except Exception as e:
              QMessageBox.critical(self, "Export Error", str(e))

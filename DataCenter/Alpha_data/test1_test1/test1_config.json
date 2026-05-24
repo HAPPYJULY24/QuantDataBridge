@@ -1,0 +1,32 @@
+{
+    "metadata": {
+        "strategy_id": "test1",
+        "strategy_name": "test1",
+        "status": "ALPHA_DRAFT",
+        "created_at": "2026-04-20T22:40:27.821026",
+        "metrics_schema_version": "alpha_kpi_v2",
+        "t_stat_method": "newey_west",
+        "p_value_method": "approx_from_displayed_t_stat"
+    },
+    "environment_config": {
+        "universe": "Aligned_Data_TEST1 (Aligned)",
+        "timeframe": "unknown"
+    },
+    "alpha_pipeline": {
+        "expression": "# 核心代码一：计算价差\nspread = df['myx-fcpo1!_close'] - df['zl1!_close']\n\n# 核心代码二：计算 Z-Score 因子\ndf['factor'] = (spread - spread.rolling(40).mean()) / spread.rolling(40).std()",
+        "winsor_method": "3-Sigma",
+        "quantile_lb": 0.01,
+        "quantile_ub": 0.99,
+        "risk_factors": [],
+        "ridge_alpha": 1.0,
+        "auto_drop_zero_vol": false
+    },
+    "backtest_profile": {
+        "settings": null,
+        "metrics": null
+    },
+    "risk_audit": {
+        "status": "PENDING",
+        "details": null
+    }
+}

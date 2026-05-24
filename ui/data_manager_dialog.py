@@ -333,13 +333,14 @@ class DataManagerDialog(QDialog):
     def refresh_signals(self):
         """Refresh Signals Tab"""
         self.signal_table.setRowCount(0)
-        files = list(self.signals_dir.glob("*.parquet"))
+        files = self._signal_files()
         
         for f in files:
             try:
                 stat = f.stat()
                 size_kb = stat.st_size / 1024
                 mtime = datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M')
+                display_name = str(f.relative_to(self.signals_dir))
                 
                 # Read metadata (first row) to get asset info
                 meta_df = pd.read_parquet(f).head(1)
@@ -357,12 +358,13 @@ class DataManagerDialog(QDialog):
                 row = self.signal_table.rowCount()
                 self.signal_table.insertRow(row)
                 
-                self.signal_table.setItem(row, 0, QTableWidgetItem(f.name))
+                name_item = QTableWidgetItem(display_name)
+                name_item.setToolTip(str(f.absolute()))
+                self.signal_table.setItem(row, 0, name_item)
                 self.signal_table.setItem(row, 1, QTableWidgetItem(mtime))
                 self.signal_table.setItem(row, 2, QTableWidgetItem(f"{size_kb:.1f}"))
                 self.signal_table.setItem(row, 3, QTableWidgetItem(asset))
                 self.signal_table.setItem(row, 4, QTableWidgetItem(str(rows)))
-                self.signal_table.setItem(row, 5, QTableWidgetItem(str(f.absolute()))) # Hidden col? No, just use user role or similar.
                 
                 # Store full path in user role of first item
                 self.signal_table.item(row, 0).setData(Qt.ItemDataRole.UserRole, str(f.absolute()))
@@ -375,6 +377,12 @@ class DataManagerDialog(QDialog):
         self.exported_signals_label.setText(
             f"💾 导出的数据文件: exported_data/ ({exported_count} 个文件, {exported_size_mb:.2f} MB)"
         )
+
+    def _signal_files(self):
+        """Return all Alpha signal parquet files, including package subfolders."""
+        if not self.signals_dir.exists():
+            return []
+        return sorted(self.signals_dir.rglob("*.parquet"), key=lambda p: str(p.relative_to(self.signals_dir)).lower())
 
     def _open_dir(self, path):
         CacheManager.open_directory_in_explorer(str(path))
@@ -403,7 +411,9 @@ class DataManagerDialog(QDialog):
             for r in rows:
                 path = self.signal_table.item(r.row(), 0).data(Qt.ItemDataRole.UserRole)
                 try:
-                    os.remove(path)
+                    file_path = Path(path)
+                    file_path.unlink()
+                    self._remove_empty_signal_package_dir(file_path.parent)
                 except Exception as e:
                     print(e)
             self.refresh_signals()
@@ -437,7 +447,7 @@ class DataManagerDialog(QDialog):
 
     def _on_export_all_signals(self):
         """批量导出所有信号文件为CSV"""
-        files = list(self.signals_dir.glob("*.parquet"))
+        files = self._signal_files()
         if not files:
             QMessageBox.information(self, "提示", "没有信号文件可导出！")
             return
@@ -494,7 +504,7 @@ class DataManagerDialog(QDialog):
 
     def _on_clear_all_signals(self):
         """清空所有信号文件（带自动备份）"""
-        files = list(self.signals_dir.glob("*.parquet"))
+        files = self._signal_files()
         if not files:
             QMessageBox.information(self, "提示", "没有信号文件可清理！")
             return
@@ -521,16 +531,29 @@ class DataManagerDialog(QDialog):
         for f in files:
             try:
                 # Backup logic
-                backup_path = archive_dir / f"{f.stem}_{timestamp}.parquet"
+                rel_stem = "_".join(f.relative_to(self.signals_dir).with_suffix("").parts)
+                backup_path = archive_dir / f"{rel_stem}_{timestamp}.parquet"
                 shutil.copy2(str(f), str(backup_path))
                 # Delete logic
-                os.remove(str(f))
+                f.unlink()
+                self._remove_empty_signal_package_dir(f.parent)
                 success_count += 1
             except Exception as e:
                 print(f"Error handling {f}: {e}")
                 
         QMessageBox.information(self, "清理完成", f"成功备份并删除了 {success_count} 个信号文件。")
         self.refresh_signals()
+
+    def _remove_empty_signal_package_dir(self, directory: Path):
+        """Remove an empty Alpha package folder after its parquet is deleted."""
+        try:
+            directory = Path(directory)
+            if directory == self.signals_dir or self.signals_dir not in directory.parents:
+                return
+            if not any(directory.iterdir()):
+                directory.rmdir()
+        except Exception:
+            pass
 
     def _show_preview(self, filepath):
         try:
