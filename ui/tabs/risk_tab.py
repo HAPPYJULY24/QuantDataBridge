@@ -676,39 +676,29 @@ class RiskTab(QWidget):
             if universe_clean.endswith(suffix):
                 universe_clean = universe_clean[:-len(suffix)]
 
-        signals_dir = Path("datacenter/Alpha_data")
         raw_align_dir = Path("datacenter/RawData/alignment")
         datacenter_dir = Path("datacenter")
-        alpha_stg_dir = signals_dir / folder_name
         
         possible_paths = [
-            dc_path / "signals.parquet",
-            alpha_stg_dir / "*.parquet",
-            signals_dir / f"{universe_clean}_{timeframe}.parquet",
-            signals_dir / f"{universe_clean}.parquet",
+            dc_path / "*.parquet",
             raw_align_dir / f"{universe_clean}.parquet",
             raw_align_dir / f"{universe_clean}_{timeframe}.parquet",
         ]
         
         signal_path = None
-        # 1. 优先在匹配的工作区策略文件夹中寻找 Parquet 文件
+        # 1. 必须且仅在匹配的 Backtest_data 策略文件夹中寻找 Parquet 文件 (保证单目录聚拢读取，严禁跨至 Alpha_data 越权嗅探)
         if dc_path.exists():
             parquets = list(dc_path.glob("signals.parquet"))
+            if not parquets:
+                parquets = list(dc_path.glob("*_data.parquet"))
             if not parquets:
                 parquets = list(dc_path.glob("*.parquet"))
             if parquets:
                 signal_path = str(parquets[0])
                 
-        if not signal_path and alpha_stg_dir.exists():
-            parquets = list(alpha_stg_dir.glob("*.parquet"))
-            if parquets:
-                signal_path = str(parquets[0])
-                
-        # 2. 如果策略文件夹中未找到，则安全降级到原有的 universe 行情匹配逻辑（在 Alpha_data 和 RawData/alignment 搜索）
+        # 2. 如果策略文件夹中未找到 (如历史遗留的旧策略)，则安全降级到对齐行情匹配逻辑 (在 RawData/alignment 搜索)
         if not signal_path:
             legacy_paths = [
-                signals_dir / f"{universe_clean}_{timeframe}.parquet",
-                signals_dir / f"{universe_clean}.parquet",
                 raw_align_dir / f"{universe_clean}.parquet",
                 raw_align_dir / f"{universe_clean}_{timeframe}.parquet",
             ]
@@ -717,13 +707,7 @@ class RiskTab(QWidget):
                     signal_path = str(p)
                     break
             
-            # 3. 如果仍未找到，在 Alpha_data 目录递归模糊搜索
-            if not signal_path and signals_dir.exists():
-                candidates = sorted(signals_dir.rglob(f"{universe_clean}*.parquet"))
-                if candidates:
-                    signal_path = str(candidates[0])
-            
-            # 4. 如果仍未找到，在 RawData 目录递归模糊搜索
+            # 3. 如果仍未找到，在 RawData 目录递归模糊搜索
             if not signal_path and datacenter_dir.exists():
                 candidates = sorted(datacenter_dir.rglob(f"*{universe_clean}*.parquet"))
                 if candidates:

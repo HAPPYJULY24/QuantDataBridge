@@ -286,10 +286,10 @@ class BacktestTab(QWidget):
         
         header_layout.addStretch()
         
-        self.export_btn = QPushButton("💾 Export Backtest Info")
-        self.export_btn.setEnabled(False) # Enabled after run
-        self.export_btn.clicked.connect(self._export_trade_log)
-        header_layout.addWidget(self.export_btn)
+        # self.export_btn = QPushButton("💾 Export Backtest Info")
+        # self.export_btn.setEnabled(False) # Enabled after run
+        # self.export_btn.clicked.connect(self._export_trade_log)
+        # header_layout.addWidget(self.export_btn)
         
         right_layout.addLayout(header_layout)
         
@@ -464,7 +464,7 @@ class BacktestTab(QWidget):
             
         self.audit_label.setText("✅ Backtest Finished")
         self.current_results = results
-        self.export_btn.setEnabled(True)
+        # self.export_btn.setEnabled(True)
         
         self._update_metrics(results['metrics'])
         self._update_charts(results)
@@ -490,20 +490,24 @@ class BacktestTab(QWidget):
             QMessageBox.information(self, "Backtest Complete", "Backtest finished successfully!")
             
         # ========================================================
-        # Phase 2: Baton Relay State Transition (Update Profile)
+        # Phase 2: Baton Relay State Transition (Auto-Export to Backtest_data)
         # ========================================================
         import os
+        import shutil
         from src.core.models.strategy_config import StrategyConfig
+        from utils.cache_manager import CacheManager
         
         json_path = getattr(self, '_last_json_path', None)
-        if json_path:
+        signal_path = getattr(self, '_last_signal_path', None)
+        
+        if json_path and signal_path:
             try:
-                # 1. Deserialize or Initialize
+                stg_name = Path(signal_path).parent.name
+                
+                # 1. Deserialize from Alpha_data (Read-only) or Initialize
                 if os.path.exists(json_path):
                     config = StrategyConfig.from_json(json_path)
                 else:
-                    # Initialize in-memory config for new workspace
-                    stg_name = Path(self._last_signal_path).parent.name
                     from src.core.models.strategy_config import StrategyMetadata, EnvironmentConfig, AlphaPipelineConfig, AlphaProfile, BacktestProfile
                     config = StrategyConfig(
                         metadata=StrategyMetadata(
@@ -531,22 +535,52 @@ class BacktestTab(QWidget):
                         clean_metrics[k] = str(v)
                 config.backtest_profile.metrics = clean_metrics
                 
-                # 3. State Transition: Enforce minimum state upgrades
-                if config.metadata.status == "ALPHA_DRAFT":
-                    config.metadata.status = "BACKTESTED"
+                # 3. State Transition: Enforce status upgrade
+                config.metadata.status = "BACKTESTED"
                 
-                # Overwrite DNA config
-                config.to_json(json_path)
+                # 4. Determine Target Directory under Backtest_data
+                target_dir = CacheManager.get_backtest_storage_dir() / stg_name
+                target_dir.mkdir(parents=True, exist_ok=True)
                 
-                # 4. Dump Trade Log CSV into the same folder
-                folder_path = Path(self._last_signal_path).parent
+                stg_id = config.metadata.strategy_id
+                
+                # 5. Save modern config `{stg_id}_config.json` inside Backtest_data
+                config.to_json(str(target_dir / f"{stg_id}_config.json"))
+                
+                # 6. Save Legacy DNA backup `{stg_id}.json` inside Backtest_data
+                try:
+                    dna = self.generate_strategy_dna()
+                    # Ensure stg_id in DNA identification matches config
+                    dna["identification"]["strategy_id"] = stg_id
+                    with open(target_dir / f"{stg_id}.json", "w", encoding="utf-8") as f:
+                        json.dump(dna, f, indent=2, ensure_ascii=False)
+                except Exception as dna_ex:
+                    print(f"[WARNING] Failed to generate legacy DNA: {dna_ex}")
+                
+                # 7. Dump Trade Log CSV `{stg_id}_tradelog.csv` into Backtest_data
                 trades_df = results.get('trades')
                 if trades_df is not None and not trades_df.empty:
-                    stg_id = config.metadata.strategy_id
-                    trades_df.to_csv(folder_path / f"{stg_id}_tradelog.csv", index=False)
+                    trades_df.to_csv(target_dir / f"{stg_id}_tradelog.csv", index=False)
+                elif 'trade_log' in results and results['trade_log'] is not None and not results['trade_log'].empty:
+                    results['trade_log'].to_csv(target_dir / f"{stg_id}_tradelog.csv", index=False)
+                
+                # 8. Dump Equity Curve CSV `{stg_id}.csv` into Backtest_data
+                if 'equity_curve' in results and results['equity_curve'] is not None:
+                    eq_df = results['equity_curve']
+                    if isinstance(eq_df, list):
+                        eq_df = pd.DataFrame(eq_df)
+                    if hasattr(eq_df, 'to_csv'):
+                        eq_df.to_csv(target_dir / f"{stg_id}.csv", index=False)
+                elif trades_df is not None and not trades_df.empty:
+                    trades_df.to_csv(target_dir / f"{stg_id}.csv", index=False)
+                
+                # 9. Copy the source signal Parquet file from Alpha_data to Backtest_data as `{stg_id}_data.parquet`
+                if os.path.exists(signal_path):
+                    shutil.copy2(signal_path, target_dir / f"{stg_id}_data.parquet")
+                    print(f"[INFO] Copied signal parquet to backtest folder: {target_dir / f'{stg_id}_data.parquet'}")
                 
                 # Update UI Alert Banner to confirm Relay
-                self.audit_label.setText(self.audit_label.text() + " | 🔋 Baton Relay: UPDATED")
+                self.audit_label.setText(self.audit_label.text() + " | 🔋 Auto-Relay: SAVED TO BACKTEST_DATA")
                 
             except Exception as e:
                 print(f"[ERROR] Baton Relay Phase 2 save failed: {e}")
