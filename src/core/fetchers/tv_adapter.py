@@ -195,19 +195,22 @@ class TradingViewAdapter(BaseAdapter):
         else:
             return 'MYX'  # Default to Bursa Malaysia
     
-    def _detect_rollover(self, df: pd.DataFrame, code: str):
+    def _detect_rollover(self, df: pd.DataFrame, code: str) -> list:
         """
         Detect contract rollover in continuous futures (Bursa Challenge enhancement).
         
         Monitors for large price gaps (>5%) which may indicate contract rollover.
-        Logs warning if detected.
+        Logs warning and records rollover metadata.
         
         Args:
             df: DataFrame with OHLCV data
             code: Futures code
+            
+        Returns:
+            List of dictionaries containing rollover info
         """
         if len(df) < 2:
-            return
+            return []
         
         # Calculate price change between consecutive bars
         df['_price_change_pct'] = df['Close'].pct_change().abs() * 100
@@ -216,22 +219,40 @@ class TradingViewAdapter(BaseAdapter):
         rollover_threshold = 5.0  # 5%
         large_gaps = df[df['_price_change_pct'] > rollover_threshold]
         
+        rollover_list = []
         if not large_gaps.empty:
             for idx, row in large_gaps.iterrows():
-                if idx > 0:
-                    prev_close = df.loc[idx-1, 'Close']
+                # We need positional index to get previous row
+                pos_idx = df.index.get_loc(row.name)
+                if pos_idx > 0:
+                    prev_row = df.iloc[pos_idx - 1]
+                    prev_close = prev_row['Close']
                     curr_close = row['Close']
                     gap_pct = row['_price_change_pct']
+                    gap_abs = curr_close - prev_close
                     
-                    # Log warning (this will be captured by UI if signal_emitter is available)
+                    roll_info = {
+                        'date': str(row['Date']),
+                        'prev_close': float(prev_close),
+                        'curr_close': float(curr_close),
+                        'gap_pct': float(gap_pct),
+                        'gap_abs': float(gap_abs)
+                    }
+                    rollover_list.append(roll_info)
+                    
+                    # Log warning
                     print(
                         f"⚠️ [ROLLOVER DETECTED] {code}: "
                         f"价格从 {prev_close:.2f} 跳至 {curr_close:.2f} "
-                        f"(变化 {gap_pct:.2f}%) at {row['Date']}"
+                        f"(变化 {gap_pct:.2f}%, 绝对缺口 {gap_abs:.2f}) at {row['Date']}"
                     )
+        
+        # Store rollovers inside DataFrame attributes
+        df.attrs['rollovers'] = rollover_list
         
         # Clean up temporary column
         df.drop('_price_change_pct', axis=1, inplace=True, errors='ignore')
+        return rollover_list
     
     def _is_network_error(self, error_msg: str) -> bool:
         """Check if error is network-related."""

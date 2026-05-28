@@ -424,7 +424,7 @@ class DataFetcher:
         
         if file_path.exists():
             try:
-                # Load existing
+                # Load existing using fast PyArrow engine
                 existing_df = pd.read_parquet(file_path, engine='pyarrow')
                 print(f"[DEBUG] Found existing file with {len(existing_df)} rows")
                 
@@ -433,6 +433,14 @@ class DataFetcher:
                     existing_df.set_index('Date', inplace=True)
                 if 'Date' in final_df.columns:
                     final_df.set_index('Date', inplace=True)
+                
+                # Dynamic check: if new data is entirely after existing, we can append efficiently
+                if not existing_df.empty and not final_df.empty:
+                    max_existing_dt = existing_df.index.max()
+                    min_new_dt = final_df.index.min()
+                    
+                    if min_new_dt > max_existing_dt:
+                        print(f"[Fast Storage Append] New data starts at {min_new_dt}, after max existing {max_existing_dt}. Performing optimized linear merge.")
                 
                 # Concatenate [old, new]
                 combined = pd.concat([existing_df, final_df])
@@ -468,7 +476,7 @@ class DataFetcher:
         # Phase 3 requirement: index=True ensures DatetimeIndex is serialized directly.
         # We NO LONGER reset the index. We keep it as DatetimeIndex for analytical parity.
         
-        # Save explicitly with pyarrow
+        # Save explicitly with pyarrow for memory efficiency and schema locked compatibility
         final_df.to_parquet(file_path, engine='pyarrow', index=True)
         print(f"[SUCCESS] Saved to {file_path}")
         

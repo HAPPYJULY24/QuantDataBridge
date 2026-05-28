@@ -9,6 +9,8 @@
 
 import os
 import pandas as pd
+import numpy as np
+import pytz
 from pathlib import Path
 from datetime import datetime
 from typing import List, Optional, Tuple
@@ -17,16 +19,18 @@ from typing import List, Optional, Tuple
 class DataProcessor:
     """µò░µì«σñäτÉåσÖ¿ - Φ┤ƒΦ┤úσñÜσôüτºìµò░µì«τÜäσ»╣Θ╜ÉΣ╕ÄσÉêσ╣╢"""
     
-    def __init__(self, store_dir: str = "data/store", output_dir: str = "data/processed"):
+    def __init__(self, store_dir: str = "data/store", output_dir: str = "data/processed", tz_mapping: Optional[dict] = None):
         """
         σê¥σºïσîûµò░µì«σñäτÉåσÖ¿
         
         Args:
             store_dir: σÄƒσºïµò░µì«σ¡ÿσé¿τ¢«σ╜ò
             output_dir: σñäτÉåσÉÄµò░µì«Φ╛ôσç║τ¢«σ╜ò
+            tz_mapping: σæêσÉìσê░µù╢σî║τÜäσè¿µÇüµÿáσ░ä
         """
         self.store_dir = Path(store_dir)
         self.output_dir = Path(output_dir)
+        self.tz_mapping = tz_mapping or {}
         
         # τí«Σ┐¥Φ╛ôσç║τ¢«σ╜òσ¡ÿσ£¿
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -34,6 +38,7 @@ class DataProcessor:
         print(f"[DataProcessor] σê¥σºïσîûσ«îµêÉ")
         print(f"[DataProcessor] µò░µì«µ║Éτ¢«σ╜ò: {self.store_dir}")
         print(f"[DataProcessor] Φ╛ôσç║τ¢«σ╜ò: {self.output_dir}")
+
     
     def align_datasets(
         self, 
@@ -304,8 +309,138 @@ class DataProcessor:
             overlap_pct = df['is_overlap'].sum() / len(df) * 100
             print(f"  - ΘçìσÅáµù╢Θù┤µ«╡σìáµ»ö: {overlap_pct:.1f}%")
     
-    # ========== ≡ƒåò Generic Alignment Method for GUI ==========
+    # ========== 🚀 Generic Alignment Method for GUI ==========
     
+    def _get_timezone_for_symbol(self, symbol: str) -> str:
+        """Get the physical native timezone of an asset based on its symbol."""
+        symbol_upper = symbol.upper()
+        
+        # Check custom dynamic tz_mapping first
+        if symbol_upper in self.tz_mapping:
+            return self.tz_mapping[symbol_upper]
+        for key, tz in self.tz_mapping.items():
+            if key.upper() in symbol_upper:
+                return tz
+                
+        # Bursa Malaysia Stocks & Futures (MYX)
+        if (symbol_upper.endswith('.KL') or 
+            symbol_upper.startswith('MYX:') or 
+            'FCPO' in symbol_upper or 
+            'FKLI' in symbol_upper):
+            return 'Asia/Kuala_Lumpur'
+            
+        # CBOT / US Ag Futures
+        cbot_symbols = ['ZL', 'BO', 'ZS', 'ZC', 'ZW', 'MYM', 'ZN', 'ZT', 'ZF', 'ZB']
+        if any(symbol_upper.startswith(prefix) for prefix in cbot_symbols):
+            return 'America/Chicago'
+            
+        # Crypto
+        if '/' in symbol or '-' in symbol or symbol_upper in ['BTC', 'ETH', 'SOL', 'USDT']:
+            return 'UTC'
+            
+        # US Stocks / standard US indices
+        return 'America/New_York'
+
+
+    def _normalize_df_timezone(self, df: pd.DataFrame, symbol: str) -> pd.DataFrame:
+        """
+        Restore naive datetime index to symbol's physical timezone,
+        and convert to UTC baseline for accurate, leakage-free matching.
+        """
+        df = df.copy()
+        physical_tz = pytz.timezone(self._get_timezone_for_symbol(symbol))
+        
+        # Ensure DatetimeIndex
+        if not isinstance(df.index, pd.DatetimeIndex):
+            df.index = pd.to_datetime(df.index)
+            
+        # Localize if naive, otherwise convert
+        if df.index.tz is None:
+            df.index = df.index.tz_localize(physical_tz)
+            print(f"[Timezone Normalize] Localized naive index of {symbol} to {physical_tz}")
+        else:
+            df.index = df.index.tz_convert(physical_tz)
+            print(f"[Timezone Normalize] Converted index of {symbol} to {physical_tz}")
+            
+        # Convert to UTC for matching parity
+        df.index = df.index.tz_convert('UTC')
+        return df
+
+    def adjust_contract_rollover(
+        self, 
+        df: pd.DataFrame, 
+        symbol: str, 
+        mode: str = 'panama', 
+        threshold_pct: float = 5.0
+    ) -> pd.DataFrame:
+        """
+        Apply contract rollover price adjustment backward (Panama or Ratio method)
+        to eliminate price gaps in continuous contracts.
+        """
+        if mode == 'none' or not mode:
+            return df
+            
+        # Only adjust futures symbols (Bursa Futures or CBOT proxies)
+        symbol_upper = symbol.upper()
+        is_future = ('1!' in symbol or '2!' in symbol or '=' in symbol or 
+                     any(symbol_upper.startswith(prefix) for prefix in ['FCPO', 'FKLI', 'ZL', 'BO', 'ZS', 'ZC', 'ZW']))
+        
+        if not is_future:
+            return df
+            
+        df = df.copy()
+        if len(df) < 2 or 'Close' not in df.columns:
+            return df
+            
+        print(f"[Rollover Adjust] Checking rollover gaps for {symbol} (mode: {mode})...")
+        
+        # 1. Compute price return between consecutive rows
+        price_change_pct = df['Close'].pct_change().abs() * 100
+        roll_mask = price_change_pct > threshold_pct
+        
+        # Clean any NaN from mask
+        roll_mask = roll_mask.fillna(False)
+        
+        roll_count = roll_mask.sum()
+        if roll_count == 0:
+            print(f"[Rollover Adjust] No rollover gaps detected (>={threshold_pct}%) for {symbol}.")
+            return df
+            
+        print(f"[Rollover Adjust] Detected {roll_count} rollover gaps for {symbol}.")
+        
+        # 2. Vectorized backward adjustment with non-negative price clipping (巴拿马负价防御)
+        if mode == 'panama':
+            # Panama / Spread Adjustment: shift past prices by absolute gap
+            gap = df['Close'] - df['Close'].shift(1)
+            gaps = gap.where(roll_mask, 0.0)
+            
+            # Sum of future gaps: reverse cumsum reverse shift
+            cumulative_shift = gaps.iloc[::-1].cumsum().iloc[::-1].shift(-1).fillna(0.0)
+            
+            # Apply to OHLC columns and clip to ensure positive price floor (防止负价漏洞)
+            for col in ['Open', 'High', 'Low', 'Close']:
+                if col in df.columns:
+                    df[col] = (df[col] + cumulative_shift).clip(lower=0.01)
+                    
+            print(f"[Rollover Adjust] Applied Panama spread shift with non-negative floor. Max shift: {cumulative_shift.iloc[0]:.2f}")
+            
+        elif mode == 'ratio':
+            # Ratio Adjustment: multiply past prices by ratio
+            ratio = df['Close'] / df['Close'].shift(1)
+            ratios = ratio.where(roll_mask, 1.0)
+            
+            # Product of future ratios: reverse cumprod reverse shift
+            cumulative_ratio = ratios.iloc[::-1].cumprod().iloc[::-1].shift(-1).fillna(1.0)
+            
+            # Apply to OHLC columns and clip to ensure positive price floor
+            for col in ['Open', 'High', 'Low', 'Close']:
+                if col in df.columns:
+                    df[col] = (df[col] * cumulative_ratio).clip(lower=0.01)
+                    
+            print(f"[Rollover Adjust] Applied Proportional Ratio shift with non-negative floor. Early ratio: {cumulative_ratio.iloc[0]:.4f}")
+            
+        return df
+
     def align_custom_files(
         self,
         file_path_a: str,
@@ -313,28 +448,35 @@ class DataProcessor:
         output_filename: Optional[str] = None,
         apply_ffill: bool = True,
         ffill_asset: str = 'B',  # 'A', 'B', or 'both'
-        only_overlap: bool = False
+        only_overlap: bool = False,
+        adjust_rollover: bool = True,
+        rollover_mode: str = 'panama',
+        rollover_threshold: float = 5.0
     ) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """
-        ΘÇÜτö¿µûçΣ╗╢σ»╣Θ╜Éµû╣µ│ò - µö»µîüΣ╗╗µäÅΣ╕ñΣ╕¬ Parquet µûçΣ╗╢τÜäσ»╣Θ╜É (GUI τëêµ£¼)
+        通用文件对齐方法 - 支持任意两个 Parquet 文件的对齐 (GUI 版本)
         
         **Killer Fixes:**
-        1. µù╢σî║σñäτÉå∩╝ÜΦç¬σè¿µúÇµ╡ïσ╣╢τ╗ƒΣ╕ÇΦ╜¼µìóΣ╕║ UTC
-        2. σè¿µÇüσêùσÉì∩╝ÜΣ╗ÄµûçΣ╗╢σÉìµÅÉσÅû symbol σ╣╢Θçìσæ╜σÉìσêù
-        3. σëìσÉæσí½σàà∩╝ÜσÅ»ΘÇëτÜä ffill() σñäτÉåΣ╕ìσÉîΣ║ñµÿôµù╢Θù┤
+        1. 时区处理：TZ-Aware 转换至 UTC 再 Outer Join，彻底解决未来函数
+        2. 展期跳空：差额 (Panama) 或比例复权，避免因子挖掘假信号
+        3. 前向填充：仅对 OHLC 填充，Volume 填充 0.0
         
         Args:
-            file_path_a: Asset A µûçΣ╗╢Φ╖»σ╛ä (Base)
-            file_path_b: Asset B µûçΣ╗╢Φ╖»σ╛ä (Reference)
-            output_filename: Φ╛ôσç║µûçΣ╗╢σÉì (Θ╗ÿΦ«ñΦç¬σè¿τöƒµêÉ)
-            apply_ffill: µÿ»σÉªσ║öτö¿σëìσÉæσí½σàà
-            ffill_asset: σ»╣σô¬Σ╕¬Φ╡äΣ║ºσ║öτö¿σí½σàà ('A', 'B', or 'both')
+            file_path_a: Asset A 文件路径 (Base)
+            file_path_b: Asset B 文件路径 (Reference)
+            output_filename: 输出文件名 (默认自动生成)
+            apply_ffill: 是否应用前向填充
+            ffill_asset: 对哪个资产应用填充 ('A', 'B', or 'both')
+            only_overlap: 是否仅保留重叠时间段
+            adjust_rollover: 是否应用展期跳空价格复权
+            rollover_mode: 复权方式 ('panama' 或 'ratio')
+            rollover_threshold: 展期跳空百分比阈值 (默认 5.0%)
         
         Returns:
-            Tuple[σ«îµò┤ DataFrame, ΘóäΦºê DataFrame (σëì50+σÉÄ50Φíî)]
+            Tuple[完整 DataFrame, 预览 DataFrame (前50+后50行)]
         """
         print(f"\n{'='*70}")
-        print(f"[DataProcessor] ≡ƒöä Generic Alignment - GUI Mode")
+        print(f"[DataProcessor] 🚀 Generic Alignment - GUI Mode")
         print(f"{'='*70}")
         print(f"[Asset A (Base)]:      {Path(file_path_a).name}")
         print(f"[Asset B (Reference)]: {Path(file_path_b).name}")
@@ -370,11 +512,16 @@ class DataProcessor:
         print(f"  - {symbol_a}: {len(df_a)} 行")
         print(f"  - {symbol_b}: {len(df_b)} 行\n")
         
-        # 3. ≡ƒöÑ Killer Fix 1: µù╢σî║σñäτÉå
-        df_a = self._fix_timezone(df_a, symbol_a)
-        df_b = self._fix_timezone(df_b, symbol_b)
+        # 3. 🛡️ 展期跳空价格复权 (Contract Rollover Panama/Ratio Adjustment)
+        if adjust_rollover:
+            df_a = self.adjust_contract_rollover(df_a, symbol_a, mode=rollover_mode, threshold_pct=rollover_threshold)
+            df_b = self.adjust_contract_rollover(df_b, symbol_b, mode=rollover_mode, threshold_pct=rollover_threshold)
+        
+        # 4. 🔥 Killer Fix 1: 物理时区高精度还原并标准化到 UTC
+        df_a = self._normalize_df_timezone(df_a, symbol_a)
+        df_b = self._normalize_df_timezone(df_b, symbol_b)
 
-        # 4. ≡ƒöÑ Killer Fix 0: Clean Non-Trading Days (Volume=0 for 1d)
+        # 5. Clean Non-Trading Days (Volume=0 for 1d)
         # Extract timeframe from filename (e.g. 1155.KL_1d.parquet -> 1d)
         try:
              timeframe_a = file_path_a.rsplit('_', 1)[-1].replace('.parquet', '')
@@ -386,26 +533,23 @@ class DataProcessor:
         df_a = self.clean_non_trading_days(df_a, timeframe_a)
         df_b = self.clean_non_trading_days(df_b, timeframe_b)
         
-        # 5. ≡ƒöÑ Killer Fix 2: σè¿µÇüσêùσÉìΘçìσæ╜σÉì
+        # 6. 🔥 Killer Fix 2: 动态列名重命名 (添加前缀)
         df_a = self._rename_columns_with_prefix(df_a, symbol_a)
         df_b = self._rename_columns_with_prefix(df_b, symbol_b)
         
-        # 6. σÉêσ╣╢µò░µì« (Outer Join)
-        print(f"[DataProcessor] ≡ƒôè σÉêσ╣╢µò░µì« (Outer Join)...\n")
-        
-        # Σ╜┐τö¿ concat ΦÇîΣ╕ìµÿ» merge∩╝îσ¢áΣ╕║ Date σ╖▓τ╗Åµÿ» index
+        # 7. 合并数据 (UTC 空间下的绝对时间 Outer Join)
+        print(f"[DataProcessor] 📑 合并数据 (Outer Join in UTC)...")
         merged_df = pd.concat([df_a, df_b], axis=1, join='outer')
+        print(f"[DataProcessor] ✅ 合并完成: {len(merged_df)} 行\n")
         
-        print(f"[DataProcessor] Γ£à σÉêσ╣╢σ«îµêÉ: {len(merged_df)} Φíî\n")
-        
-        # 6. ≡ƒöÑ Killer Fix 3: σëìσÉæσí½σàà (Forward Fill)
+        # 8. 🔥 Killer Fix 3: 限制价格的前向填充 (ffill) 与成交量 0 填充保护
         if apply_ffill:
             merged_df = self._apply_forward_fill(merged_df, symbol_a, symbol_b, ffill_asset)
         
-        # 7. 添加 overlap 标记
+        # 9. 添加 overlap 标记
         merged_df = self._add_generic_overlap_flag(merged_df, symbol_a, symbol_b)
         
-        # 7.5 Optional Overlap Filtering
+        # 9.5 可选: 仅保留重叠时段
         if only_overlap and 'is_overlap' in merged_df.columns:
             original_len = len(merged_df)
             merged_df = merged_df[merged_df['is_overlap'] == True].copy()
@@ -413,29 +557,33 @@ class DataProcessor:
             print(f"[DataProcessor] ✂️ 启用纯净重叠模式 (only_overlap=True)")
             print(f"  - 已剔除 {deleted_rows} 行非重叠数据 (保留: {len(merged_df)} 行)\n")
         
-        # 8. Θçìτ╜«τ┤óσ╝ò∩╝îσ░å Date Φ╜¼Σ╕║σêù
+        # 10. 转换回吉隆坡本地时间并剥离时区 (Parquet 及分析兼容)
+        kl_tz = pytz.timezone('Asia/Kuala_Lumpur')
+        merged_df.index = merged_df.index.tz_convert(kl_tz).tz_localize(None)
+        
+        # 重置索引，将 Date 转为列
         merged_df.reset_index(inplace=True)
         if 'index' in merged_df.columns:
             merged_df.rename(columns={'index': 'Date'}, inplace=True)
         
-        # 9. τ╗ƒΦ«íΣ┐íµü»
+        # 11. 统计信息
         self._print_generic_statistics(merged_df, symbol_a, symbol_b)
         
-        # 10. Σ┐¥σ¡ÿµûçΣ╗╢
+        # 12. 保存文件
         if output_filename is None:
             output_filename = f"aligned_{symbol_a.replace('!', '')}_{symbol_b.replace('!', '')}.parquet"
         
         output_path = self.output_dir / output_filename
         merged_df.to_parquet(output_path, index=False)
         
-        print(f"\n[DataProcessor] ≡ƒÆ╛ µò░µì«σ╖▓Σ┐¥σ¡ÿ: {output_path}")
-        print(f"[DataProcessor] µûçΣ╗╢σñºσ░Å: {output_path.stat().st_size / 1024 / 1024:.2f} MB\n")
+        print(f"\n[DataProcessor] 💾 数据已保存: {output_path}")
+        print(f"[DataProcessor] 文件大小: {output_path.stat().st_size / 1024 / 1024:.2f} MB\n")
         print(f"{'='*70}\n")
         
-        # 11. τöƒµêÉΘóäΦºê DataFrame (σëì50 + σÉÄ50Φíî)
+        # 13. 生成预览 DataFrame (前50 + 后50行)
         preview_df = self._generate_preview(merged_df)
         
-        return merged_df, preview_df
+
     
     def _extract_symbol_from_filename(self, filepath: str) -> str:
         """
@@ -523,23 +671,25 @@ class DataProcessor:
         ffill_asset: str
     ) -> pd.DataFrame:
         """
-        ≡ƒöÑ Killer Fix 3: σëìσÉæσí½σàà (Forward Fill)
+        🔥 Killer Fix 3: 前向填充 (Forward Fill) 并进行成交量保护
         
-        σ»╣µîçσ«ÜΦ╡äΣ║ºτÜäσêùσ║öτö¿ ffill() Σ╗Ñσí½ΦíÑΣ║ñµÿôµù╢Θù┤σ╖«σ╝é
+        仅对 OHLC 价格列应用 ffill()，成交量列 Volume 强制使用 fillna(0.0) 填充。
         """
-        print(f"[Forward Fill] σ║öτö¿σëìσÉæσí½σàà (asset: {ffill_asset})...")
+        print(f"[Forward Fill] 应用前向填充并进行成交量保护 (ffill_asset: {ffill_asset})...")
         
-        if ffill_asset == 'A' or ffill_asset == 'both':
-            cols_a = [col for col in df.columns if col.startswith(f"{symbol_a}_")]
-            if cols_a:
-                df[cols_a] = df[cols_a].ffill()
-                print(f"  Γ£à σí½σàà Asset A ({symbol_a}): {len(cols_a)} σêù")
-        
-        if ffill_asset == 'B' or ffill_asset == 'both':
-            cols_b = [col for col in df.columns if col.startswith(f"{symbol_b}_")]
-            if cols_b:
-                df[cols_b] = df[cols_b].ffill()
-                print(f"  Γ£à σí½σàà Asset B ({symbol_b}): {len(cols_b)} σêù")
+        for sym, target in [(symbol_a, 'A'), (symbol_b, 'B')]:
+            if ffill_asset == target or ffill_asset == 'both':
+                # 1. 仅对价格列应用 ffill()
+                price_cols = [f"{sym}_{col}" for col in ['Open', 'High', 'Low', 'Close'] if f"{sym}_{col}" in df.columns]
+                if price_cols:
+                    df[price_cols] = df[price_cols].ffill()
+                    print(f"  ✅ 填充价格列 {sym}: {price_cols}")
+                    
+                # 2. 对成交量列强制使用 fillna(0.0) 保护
+                vol_col = f"{sym}_Volume"
+                if vol_col in df.columns:
+                    df[vol_col] = df[vol_col].fillna(0.0)
+                    print(f"  ✅ 填充成交量列 {sym}: 0.0")
         
         print()
         return df
@@ -663,7 +813,10 @@ class DataProcessor:
         anchor_index: int = 0,
         apply_ffill: bool = True,
         only_overlap: bool = False,
-        output_filename: Optional[str] = None
+        output_filename: Optional[str] = None,
+        adjust_rollover: bool = True,
+        rollover_mode: str = 'panama',
+        rollover_threshold: float = 5.0
     ) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """
         多数据流对齐 — 支持 2~5 个数据源
@@ -678,6 +831,9 @@ class DataProcessor:
             apply_ffill: 是否对非基准资产执行前向填充
             only_overlap: 是否仅保留所有资产都有数据的时间段
             output_filename: 输出文件名 (默认自动生成)
+            adjust_rollover: 是否应用价格展期复权
+            rollover_mode: 复权方式 ('panama' 或 'ratio')
+            rollover_threshold: 展期阈值 (默认 5.0%)
         
         Returns:
             Tuple[完整 DataFrame, 预览 DataFrame]
@@ -716,8 +872,12 @@ class DataProcessor:
                     f"请选择原始（未对齐的）数据文件作为输入。"
                 )
             
-            # 时区修正
-            df = self._fix_timezone(df, symbol)
+            # 🛡️ 展期跳空价格复权 (Contract Rollover Panama/Ratio Adjustment)
+            if adjust_rollover:
+                df = self.adjust_contract_rollover(df, symbol, mode=rollover_mode, threshold_pct=rollover_threshold)
+            
+            # 🔥 Killer Fix 1: 物理时区高精度还原并标准化到 UTC Baseline
+            df = self._normalize_df_timezone(df, symbol)
             
             # 清理非交易日 (仅对日线)
             try:
@@ -734,22 +894,29 @@ class DataProcessor:
         
         print(f"\n[DataProcessor] ✅ 所有文件加载完成 ({len(dfs)} 个)\n")
         
-        # 3. 多文件 Outer Join (pd.concat)
-        print(f"[DataProcessor] 📑 合并数据 (Outer Join)...")
+        # 3. 多文件 Outer Join (UTC 空间下的绝对时间合并)
+        print(f"[DataProcessor] 📑 合并数据 (Outer Join in UTC)...")
         merged_df = pd.concat(dfs, axis=1, join='outer')
         print(f"[DataProcessor] ✅ 合并完成: {len(merged_df)} 行\n")
         
-        # 4. 对非 Anchor 资产执行 ffill (基准资产概念)
+        # 4. 🔥 Killer Fix 3: 对非 Anchor 资产执行价格 ffill (成交量 0 填充保护)
         anchor_symbol = symbols[anchor_index]
         if apply_ffill:
             print(f"[Forward Fill] 基准资产: {anchor_symbol} (⚓ Anchor)")
-            print(f"[Forward Fill] 对所有非基准资产执行前向填充...")
+            print(f"[Forward Fill] 对所有非基准资产执行价格填充及成交量保护...")
             for i, symbol in enumerate(symbols):
                 if i != anchor_index:
-                    cols = [c for c in merged_df.columns if c.startswith(f"{symbol}_")]
-                    if cols:
-                        merged_df[cols] = merged_df[cols].ffill()
-                        print(f"  ✅ 填充 {symbol}: {len(cols)} 列")
+                    # 1. 仅对价格列应用 ffill()
+                    price_cols = [f"{symbol}_{col}" for col in ['Open', 'High', 'Low', 'Close'] if f"{symbol}_{col}" in merged_df.columns]
+                    if price_cols:
+                        merged_df[price_cols] = merged_df[price_cols].ffill()
+                        print(f"  ✅ 填充价格 {symbol}: {len(price_cols)} 列")
+                        
+                    # 2. 对成交量列强制使用 fillna(0.0) 保护
+                    vol_col = f"{symbol}_Volume"
+                    if vol_col in merged_df.columns:
+                        merged_df[vol_col] = merged_df[vol_col].fillna(0.0)
+                        print(f"  ✅ 保护成交量 {symbol}")
             print()
         
         # 5. 多源 overlap 标记 (所有 Close 列都有数据 = True)
@@ -769,7 +936,11 @@ class DataProcessor:
             print(f"[DataProcessor] ✂️ 启用纯净重叠模式 (only_overlap=True)")
             print(f"  - 已剔除 {deleted_rows} 行非重叠数据 (保留: {len(merged_df)} 行)\n")
         
-        # 7. 重置索引，将 Date 转为列
+        # 7. 转换回吉隆坡本地时间并剥离时区 (Parquet 及分析兼容)
+        kl_tz = pytz.timezone('Asia/Kuala_Lumpur')
+        merged_df.index = merged_df.index.tz_convert(kl_tz).tz_localize(None)
+        
+        # 重置索引，将 Date 转为列
         merged_df.reset_index(inplace=True)
         if 'index' in merged_df.columns:
             merged_df.rename(columns={'index': 'Date'}, inplace=True)
@@ -831,3 +1002,62 @@ class DataProcessor:
                 overlap_val = overlap_val.iloc[0]
             overlap_pct = float(overlap_val) / len(df) * 100
             print(f"  - 全部重叠时间段: {overlap_pct:.1f}%")
+
+    def align_multi_source_with_tz(
+        self,
+        df_a: pd.DataFrame,
+        tz_a: str,
+        prefix_a: str,
+        df_b: pd.DataFrame,
+        tz_b: str,
+        prefix_b: str,
+        apply_ffill: bool = True
+    ) -> pd.DataFrame:
+        """
+        Public end-to-end interface to align two DataFrames with timezone awareness.
+        Localizes naive index to physical timezone of each asset, converts both to UTC,
+        performs outer join, applies volume-protected ffill, converts back to local Malaysian time,
+        strips the timezone, and returns the aligned DataFrame.
+        """
+        df_a = df_a.copy()
+        df_b = df_b.copy()
+        
+        # Ensure DatetimeIndex
+        if not isinstance(df_a.index, pd.DatetimeIndex):
+            df_a.index = pd.to_datetime(df_a.index)
+        if not isinstance(df_b.index, pd.DatetimeIndex):
+            df_b.index = pd.to_datetime(df_b.index)
+            
+        # Localize A
+        tz_a_obj = pytz.timezone(tz_a)
+        if df_a.index.tz is None:
+            df_a.index = df_a.index.tz_localize(tz_a_obj)
+        else:
+            df_a.index = df_a.index.tz_convert(tz_a_obj)
+        df_a.index = df_a.index.tz_convert('UTC')
+        
+        # Localize B
+        tz_b_obj = pytz.timezone(tz_b)
+        if df_b.index.tz is None:
+            df_b.index = df_b.index.tz_localize(tz_b_obj)
+        else:
+            df_b.index = df_b.index.tz_convert(tz_b_obj)
+        df_b.index = df_b.index.tz_convert('UTC')
+        
+        # Rename columns with prefix
+        df_a = self._rename_columns_with_prefix(df_a, prefix_a)
+        df_b = self._rename_columns_with_prefix(df_b, prefix_b)
+        
+        # Merge
+        merged_df = pd.concat([df_a, df_b], axis=1, join='outer')
+        
+        # Apply forward fill with volume protection
+        if apply_ffill:
+            merged_df = self._apply_forward_fill(merged_df, prefix_a, prefix_b, 'both')
+            
+        # Convert back to KL timezone and strip tz
+        kl_tz = pytz.timezone('Asia/Kuala_Lumpur')
+        merged_df.index = merged_df.index.tz_convert(kl_tz).tz_localize(None)
+        
+        return merged_df
+

@@ -58,12 +58,13 @@ class BaseAdapter(ABC):
         """
         pass
     
-    def _standardize_timezone(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _standardize_timezone(self, df: pd.DataFrame, strip_tz: bool = True) -> pd.DataFrame:
         """
         Standardize timezone to Asia/Kuala_Lumpur.
         
         Args:
             df: DataFrame with Date column (may be UTC or naive)
+            strip_tz: If True, remove tz info and format as string for backward/parquet compatibility.
         
         Returns:
             Timezone-standardized DataFrame
@@ -82,18 +83,18 @@ class BaseAdapter(ABC):
         df['Date'] = df['Date'].dt.tz_convert(self.KL_TZ)
         print(f"[DEBUG] Timezone converted. Sample: {df['Date'].iloc[0]}")
         
-        # Remove timezone info, keep local time (Parquet compatibility)
-        df['Date'] = df['Date'].dt.tz_localize(None)
-        
-        # Convert back to string format for consistency
-        df['Date'] = df['Date'].dt.strftime('%Y-%m-%d %H:%M:%S')
+        if strip_tz:
+            # Remove timezone info, keep local time (Parquet compatibility)
+            df['Date'] = df['Date'].dt.tz_localize(None)
+            # Convert back to string format for consistency
+            df['Date'] = df['Date'].dt.strftime('%Y-%m-%d %H:%M:%S')
         
         print("[DEBUG] Timezone standardization complete")
         return df
     
     def _filter_lunch_break(self, df: pd.DataFrame, asset_type: str) -> pd.DataFrame:
         """
-        Filter lunch break (12:30-14:30 MYT) - Blacklist strategy.
+        Filter lunch break (12:30-14:30 MYT for Stocks, 12:45-14:30 MYT for Futures) - Resilient strategy.
         
         Strategy: Remove lunch noise, keep all other times (including pre/post-market)
         Applicable to: Malaysia Stock + Bursa Futures
@@ -115,26 +116,33 @@ class BaseAdapter(ABC):
         # Ensure Date column is datetime
         df['Date'] = pd.to_datetime(df['Date'])
         
-        # Extract hour and minute
-        df['_hour'] = df['Date'].dt.hour
-        df['_minute'] = df['Date'].dt.minute
+        # Extract total minutes since midnight for robust boundary filtering
+        df['_minutes_since_midnight'] = df['Date'].dt.hour * 60 + df['Date'].dt.minute
         
-        # Blacklist strategy: Define lunch break (to be removed)
-        is_lunch_break = (
-            (df['_hour'] == 12) & (df['_minute'] > 30)  # 12:31 - 12:59
-        ) | (
-            (df['_hour'] == 13)                          # 13:00 - 13:59
-        ) | (
-            (df['_hour'] == 14) & (df['_minute'] < 30)  # 14:00 - 14:29
-        )
+        # Select boundaries based on asset type
+        # Malaysia Stock: Lunch break strictly between 12:30 (750 mins) and 14:30 (870 mins)
+        # Bursa Futures (TV): Lunch break strictly between 12:45 (765 mins) and 14:30 (870 mins)
+        if asset_type == "Malaysia Stock":
+            start_lunch = 750
+        else:  # Bursa Futures (TV)
+            start_lunch = 765
+        end_lunch = 870
         
+        # We define is_lunch_break strictly inside this interval
+        # However, to be resilient: if Volume > 0, we can keep it as a closing/opening tick protection
+        is_lunch_break = (df['_minutes_since_midnight'] > start_lunch) & (df['_minutes_since_midnight'] < end_lunch)
+        
+        if 'Volume' in df.columns:
+            # Resilient boundary protection: keep the bar if it has trading volume (protect late closing auction ticks)
+            is_lunch_break = is_lunch_break & (df['Volume'] == 0)
+            
         # Filter: Keep all non-lunch-break data
         filtered_df = df[~is_lunch_break].copy()
         
-        # Remove temporary columns
-        filtered_df.drop(['_hour', '_minute'], axis=1, inplace=True)
+        # Remove temporary column
+        filtered_df.drop(['_minutes_since_midnight'], axis=1, inplace=True)
         
-        # Convert back to string format
+        # Convert back to string format if index or Date column needs consistency
         filtered_df['Date'] = filtered_df['Date'].dt.strftime('%Y-%m-%d %H:%M:%S')
         
         removed_count = len(df) - len(filtered_df)
