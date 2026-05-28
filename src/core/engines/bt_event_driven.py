@@ -347,8 +347,23 @@ class EventDrivenBacktest:
                 dir_val = current_position.direction.value
                 direction_mult = 1 if dir_val == "LONG" or dir_val == 1 else -1
                 
-                # Apply exit slippage and discretization for Margin Call close out
-                fill_price = row.close
+                # Check if it was liquidated by the Open price (Overnight Gap) or during the bar
+                floating_pnl_open = current_position.calculate_pnl(row.open)
+                open_equity = current_balance + floating_pnl_open
+                maint_margin_limit = current_position.margin_used * maintenance_margin_rate
+                
+                # Symmetrical Open Gap Breach Check
+                peak_drawdown_open = (getattr(rm, '_high_water_mark', open_equity) - open_equity) / getattr(rm, '_high_water_mark', 1.0) if getattr(rm, '_high_water_mark', 0) > 0 else 0.0
+                daily_drawdown_open = (getattr(rm, '_daily_baseline_equity', open_equity) - open_equity) / getattr(rm, '_daily_baseline_equity', 1.0) if getattr(rm, '_daily_baseline_equity', 0) > 0 else 0.0
+                
+                if (open_equity < maint_margin_limit) or (peak_drawdown_open > 0.35) or (daily_drawdown_open > 0.20):
+                    fill_price = row.open
+                    exit_reason = "Margin_Call_Gap_Open"
+                else:
+                    fill_price = row.close
+                    exit_reason = "Margin_Call_Intraday"
+                
+                # Symmetrical Discretization on Margin Call Exit
                 if direction_mult == 1:  # Selling: Floor
                     exit_price = math.floor((fill_price - slippage) / tick_size) * tick_size
                 else:  # Buying: Ceil
@@ -366,7 +381,7 @@ class EventDrivenBacktest:
                     'direction': current_position.direction.value,
                     'lots': current_position.lots,
                     'net_pnl': pnl_net,
-                    'exit_reason': "Margin_Call",
+                    'exit_reason': exit_reason,
                     'requested_price': fill_price,
                     'commission_paid': 2 * commission * lots_closed,
                     'slippage_incurred': 2 * slippage * multiplier * lots_closed,

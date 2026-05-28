@@ -204,6 +204,107 @@ class RiskWorker(QThread):
             self.error.emit(str(e) + "\n" + traceback.format_exc())
 
 
+class ExportWorker(QThread):
+    """
+    Asynchronous Worker for exporting wind-control CSV audit logs.
+    Decoupled to run in background thread, avoiding PyQt6 GUI freezing and file writing conflicts.
+    """
+    finished = pyqtSignal(list, str)
+    error    = pyqtSignal(str)
+
+    def __init__(self, current_results, save_mode, folder_name, local_dir_path, has_override):
+        super().__init__()
+        self.current_results = current_results
+        self.save_mode = save_mode
+        self.folder_name = folder_name
+        self.local_dir_path = local_dir_path
+        self.has_override = has_override
+
+    def run(self):
+        from utils.cache_manager import CacheManager
+        from pathlib import Path
+        import shutil
+        import pandas as pd
+
+        try:
+            def _write_track_csv(dest_dir, track_key, label):
+                res = self.current_results.get(track_key, {})
+
+                # Trade log
+                trades = res.get("trade_log") or res.get("trades")
+                if trades is None:
+                    return
+                if isinstance(trades, list):
+                    trades = pd.DataFrame(trades)
+                if hasattr(trades, "empty") and trades.empty:
+                    return
+                trades = trades.reset_index(drop=True)
+
+                # Risk intercept log -- keep ONLY Order_Approved (1:1 with trades)
+                audit_raw = res.get("audit_log", [])
+                if isinstance(audit_raw, list) and audit_raw:
+                    audit_all = pd.DataFrame(audit_raw)
+                elif isinstance(audit_raw, pd.DataFrame) and not audit_raw.empty:
+                    audit_all = audit_raw.copy()
+                else:
+                    audit_all = pd.DataFrame()
+
+                if not audit_all.empty and "Type" in audit_all.columns:
+                    approved = (audit_all[audit_all["Type"] == "Order_Approved"]
+                                .reset_index(drop=True))
+                    intercept_df = pd.DataFrame({
+                        "risk_decision":      approved["Type"].values      if "Type"      in approved.columns else [],
+                        "risk_direction":     approved["Direction"].values  if "Direction" in approved.columns else [],
+                        "risk_approved_lots": approved["Volume"].values     if "Volume"   in approved.columns else [],
+                        "risk_reason":        approved["Reason"].values     if "Reason"   in approved.columns else [],
+                    }).reset_index(drop=True)
+                else:
+                    intercept_df = pd.DataFrame()
+
+                if not intercept_df.empty:
+                    n = max(len(trades), len(intercept_df))
+                    trades       = trades.reindex(range(n))
+                    intercept_df = intercept_df.reindex(range(n))
+                    sep = pd.DataFrame({"risk_SEPARATOR": [""] * n})
+                    combined = pd.concat([trades, sep, intercept_df], axis=1)
+                else:
+                    combined = trades
+
+                combined.to_csv(dest_dir / f"{label}_trade_log.csv",
+                                index=False, encoding="utf-8-sig")
+
+            paths_created = []
+            dc_base = None
+
+            if self.save_mode in ("data_center", "both"):
+                dc_base = CacheManager.get_risk_storage_dir() / self.folder_name
+                dc_base.mkdir(parents=True, exist_ok=True)
+                _write_track_csv(dc_base, "base",     "BASE")
+                _write_track_csv(dc_base, "original", "ORIGINAL")
+                if self.has_override:
+                    _write_track_csv(dc_base, "override", "OVERRIDE")
+                paths_created.append(f"Data Center:\n{dc_base}")
+
+            if self.save_mode in ("local", "both"):
+                local_base = Path(self.local_dir_path) / self.folder_name
+                if self.save_mode == "both" and dc_base and dc_base.exists():
+                    shutil.copytree(str(dc_base), str(local_base), dirs_exist_ok=True)
+                else:
+                    local_base.mkdir(parents=True, exist_ok=True)
+                    _write_track_csv(local_base, "base",     "BASE")
+                    _write_track_csv(local_base, "original", "ORIGINAL")
+                    if self.has_override:
+                        _write_track_csv(local_base, "override", "OVERRIDE")
+                paths_created.append(f"Local Export:\n{local_base}")
+
+            tracks = ["BASE", "ORIGINAL"] + (["OVERRIDE"] if self.has_override else [])
+            files_str = ", ".join(f"{t}_trade_log.csv" for t in tracks)
+            self.finished.emit(paths_created, files_str)
+
+        except Exception as e:
+            self.error.emit(str(e))
+
+
 # ─────────────────────────────────────────────────────────
 # RISK TAB
 # ─────────────────────────────────────────────────────────
@@ -1393,7 +1494,7 @@ class RiskTab(QWidget):
             )
 
     # ===========================================================
-    # EXPORT AUDIT LOG — Folder-based, one CSV per track
+    # EXPORT AUDIT LOG — Asynchronous Threaded Export
     # ===========================================================
     def _export_audit_log(self):
         if not self.current_results:
@@ -1401,10 +1502,7 @@ class RiskTab(QWidget):
             return
 
         from ui.export_audit_dialog import ExportAuditDialog
-        from utils.cache_manager import CacheManager
         from PyQt6.QtWidgets import QFileDialog
-        from pathlib import Path
-        import shutil
 
         has_override = "override" in self.current_results
         dialog = ExportAuditDialog(has_override=has_override, parent=self)
@@ -1415,90 +1513,67 @@ class RiskTab(QWidget):
         folder_name = export_data["folder_name"]
         save_mode   = export_data["save_mode"]
 
-        try:
-            local_dir_path = None
-            if save_mode in ("local", "both"):
-                local_dir_path = QFileDialog.getExistingDirectory(
-                    self, "Select Local Export Directory", "",
-                    QFileDialog.Option.ShowDirsOnly)
-                if not local_dir_path:
-                    return
+        local_dir_path = None
+        if save_mode in ("local", "both"):
+            local_dir_path = QFileDialog.getExistingDirectory(
+                self, "Select Local Export Directory", "",
+                QFileDialog.Option.ShowDirsOnly)
+            if not local_dir_path:
+                return
 
-            def _write_track_csv(dest_dir, track_key, label):
-                res = self.current_results.get(track_key, {})
+        # Atomic Button State Defense: Disable and set loading text to prevent state competition race condition
+        self.export_btn.setEnabled(False)
+        self.export_btn.setText("⏳ Exporting...")
+        self.export_btn.setStyleSheet(
+            "background:#546E7A; color:#B0BEC5; padding:4px 10px; border-radius:4px;")
 
-                # Trade log
-                trades = res.get("trade_log") or res.get("trades")
-                if trades is None:
-                    return
-                if isinstance(trades, list):
-                    trades = pd.DataFrame(trades)
-                if hasattr(trades, "empty") and trades.empty:
-                    return
-                trades = trades.reset_index(drop=True)
+        # Launch background ExportWorker thread
+        self.export_worker = ExportWorker(
+            current_results=self.current_results,
+            save_mode=save_mode,
+            folder_name=folder_name,
+            local_dir_path=local_dir_path,
+            has_override=has_override
+        )
+        self.export_worker.finished.connect(self._on_export_finished)
+        self.export_worker.error.connect(self._on_export_error)
+        self.export_worker.start()
 
-                # Risk intercept log -- keep ONLY Order_Approved (1:1 with trades)
-                audit_raw = res.get("audit_log", [])
-                if isinstance(audit_raw, list) and audit_raw:
-                    audit_all = pd.DataFrame(audit_raw)
-                elif isinstance(audit_raw, pd.DataFrame) and not audit_raw.empty:
-                    audit_all = audit_raw.copy()
-                else:
-                    audit_all = pd.DataFrame()
+    def _on_export_finished(self, paths_created, files_str):
+        # Restore button text and enabled state
+        self.export_btn.setEnabled(True)
+        self.export_btn.setText("💾 Export Audit Log")
+        self.export_btn.setStyleSheet(
+            "background:#37474F; color:white; padding:4px 10px; border-radius:4px;")
 
-                if not audit_all.empty and "Type" in audit_all.columns:
-                    approved = (audit_all[audit_all["Type"] == "Order_Approved"]
-                                .reset_index(drop=True))
-                    intercept_df = pd.DataFrame({
-                        "risk_decision":      approved["Type"].values      if "Type"      in approved.columns else [],
-                        "risk_direction":     approved["Direction"].values  if "Direction" in approved.columns else [],
-                        "risk_approved_lots": approved["Volume"].values     if "Volume"   in approved.columns else [],
-                        "risk_reason":        approved["Reason"].values     if "Reason"   in approved.columns else [],
-                    }).reset_index(drop=True)
-                else:
-                    intercept_df = pd.DataFrame()
+        # Safe thread cleanup
+        if hasattr(self, 'export_worker') and self.export_worker:
+            self.export_worker.wait()
+            self.export_worker.deleteLater()
+            self.export_worker = None
 
-                if not intercept_df.empty:
-                    n = max(len(trades), len(intercept_df))
-                    trades       = trades.reindex(range(n))
-                    intercept_df = intercept_df.reindex(range(n))
-                    sep = pd.DataFrame({"risk_SEPARATOR": [""] * n})
-                    combined = pd.concat([trades, sep, intercept_df], axis=1)
-                else:
-                    combined = trades
+        QMessageBox.information(
+            self,
+            "Export Successful",
+            f"Audit log exported successfully!\n\nFiles: {files_str}\n\n"
+            + "\n\n".join(paths_created)
+        )
 
-                combined.to_csv(dest_dir / f"{label}_trade_log.csv",
-                                index=False, encoding="utf-8-sig")
+    def _on_export_error(self, err_msg):
+        # Restore button text and enabled state
+        self.export_btn.setEnabled(True)
+        self.export_btn.setText("💾 Export Audit Log")
+        self.export_btn.setStyleSheet(
+            "background:#37474F; color:white; padding:4px 10px; border-radius:4px;")
 
-            paths_created = []
-            dc_base = None
+        # Safe thread cleanup
+        if hasattr(self, 'export_worker') and self.export_worker:
+            self.export_worker.wait()
+            self.export_worker.deleteLater()
+            self.export_worker = None
 
-            if save_mode in ("data_center", "both"):
-                dc_base = CacheManager.get_risk_storage_dir() / folder_name
-                dc_base.mkdir(parents=True, exist_ok=True)
-                _write_track_csv(dc_base, "base",     "BASE")
-                _write_track_csv(dc_base, "original", "ORIGINAL")
-                if has_override:
-                    _write_track_csv(dc_base, "override", "OVERRIDE")
-                paths_created.append(f"Data Center:\n{dc_base}")
-
-            if save_mode in ("local", "both"):
-                local_base = Path(local_dir_path) / folder_name
-                if save_mode == "both" and dc_base and dc_base.exists():
-                    shutil.copytree(str(dc_base), str(local_base), dirs_exist_ok=True)
-                else:
-                    local_base.mkdir(parents=True, exist_ok=True)
-                    _write_track_csv(local_base, "base",     "BASE")
-                    _write_track_csv(local_base, "original", "ORIGINAL")
-                    if has_override:
-                        _write_track_csv(local_base, "override", "OVERRIDE")
-                paths_created.append(f"Local Export:\n{local_base}")
-
-            tracks = ["BASE", "ORIGINAL"] + (["OVERRIDE"] if has_override else [])
-            files_str = ", ".join(f"{t}_trade_log.csv" for t in tracks)
-            QMessageBox.information(self, "Export Successful",
-                f"Audit log exported!\n\nFiles: {files_str}\n\n"
-                + "\n\n".join(paths_created))
-
-        except Exception as e:
-            QMessageBox.critical(self, "Export Error", str(e))
+        QMessageBox.critical(
+            self,
+            "Export Error",
+            f"An error occurred during asynchronous CSV export:\n{err_msg}"
+        )

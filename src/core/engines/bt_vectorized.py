@@ -105,7 +105,7 @@ class VectorizedBacktest:
         df = self._calculate_pnl(df, execution_mode, multiplier, sl_pct, commission, slippage, tick_size)
         
         # 7. Equity Curve & Margin (internal only — not exposed in return dict)
-        df = self._calculate_equity_and_margin(df, initial_capital, initial_margin, maintenance_margin_rate)
+        df = self._calculate_equity_and_margin(df, initial_capital, initial_margin, maintenance_margin_rate, tick_size, multiplier, slippage, execution_mode)
         
         # 8. Calculate aggregate metrics (NO trade-level data)
         metrics = self._calculate_metrics(df, initial_capital)
@@ -380,7 +380,9 @@ class VectorizedBacktest:
         return df
     
     def _calculate_equity_and_margin(self, df: pd.DataFrame, initial_capital: float,
-                                     initial_margin: float, maintenance_margin_rate: float) -> pd.DataFrame:
+                                     initial_margin: float, maintenance_margin_rate: float,
+                                     tick_size: float = 1.0, multiplier: float = 25.0,
+                                     slippage: float = 0.0, execution_mode: str = 'Close') -> pd.DataFrame:
         """Calculate equity curve and margin requirements with real-time liquidation truncation."""
         n = len(df)
         pos = df['pos'].values.copy()
@@ -422,9 +424,43 @@ class VectorizedBacktest:
             if not liquidated and pos[i] != 0 and current_equity < maint_level[i]:
                 liquidated = True
                 is_liquidated[i] = True
-                # Truncate position immediately at the liquidation bar
+                
+                # Check if it was an open-gap breach
+                if 'open' in df.columns and 'ref_price' in df.columns and 'close' in df.columns:
+                    prev_net_pnl_sum = net_pnl[:i].sum() if i > 0 else 0.0
+                    open_price = df['open'].iloc[i]
+                    ref_price = df['ref_price'].iloc[i]
+                    close_price = df['close'].iloc[i]
+                    
+                    floating_pnl_open = (open_price - ref_price) * multiplier * pos[i]
+                    equity_at_open = initial_capital + prev_net_pnl_sum + floating_pnl_open
+                    
+                    # Symmetrical Open Gap Breach Check
+                    high_water_mark = initial_capital + max(0.0, net_pnl[:i].sum()) if i > 0 else initial_capital
+                    daily_baseline = initial_capital + net_pnl[:i].sum() if i > 0 else initial_capital
+                    
+                    peak_drawdown_open = (high_water_mark - equity_at_open) / high_water_mark if high_water_mark > 0 else 0.0
+                    daily_drawdown_open = (daily_baseline - equity_at_open) / daily_baseline if daily_baseline > 0 else 0.0
+                    
+                    if (equity_at_open < maint_level[i]) or (peak_drawdown_open > 0.35) or (daily_drawdown_open > 0.20):
+                        fill_price = open_price
+                    else:
+                        fill_price = close_price
+                        
+                    # Symmetrical tick size grid discretization for gap/intraday liquidation
+                    if pos[i] > 0:  # Long: Floor
+                        exit_price = np.floor((fill_price - slippage) / tick_size) * tick_size
+                    else:  # Short: Ceil
+                        exit_price = np.ceil((fill_price + slippage) / tick_size) * tick_size
+                    
+                    # Correctly record realized PnL on liquidation bar (NO wiping to zero!)
+                    gross_pnl[i] = (exit_price - ref_price) * multiplier * pos[i]
+                else:
+                    # Graceful fallback: keep the gross_pnl[i] as is in the mock dataframe
+                    pass
+                
+                # Truncate position immediately
                 pos[i] = 0
-                gross_pnl[i] = 0.0  # Liquidation closes at the bar's entry/ref price, so no further holding PnL
                 pos_change = abs(pos[i] - pos[i-1]) if i > 0 else 0.0
                 cost[i] = pos_change * cost_per_lot
                 net_pnl[i] = gross_pnl[i] - cost[i]

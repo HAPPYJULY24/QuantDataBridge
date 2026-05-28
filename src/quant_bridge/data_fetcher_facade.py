@@ -189,6 +189,26 @@ class DataFetcher:
             )
             
             if df is not None and not df.empty:
+                # Price Clamping: Clean NaN, zero, and negative prices to protect the Numba core
+                import numpy as np
+                price_cols = [c for c in df.columns if str(c).lower() in ['open', 'high', 'low', 'close', 'price', 'last']]
+                if price_cols:
+                    for col in price_cols:
+                        invalid_mask = df[col] <= 0.0
+                        if invalid_mask.any():
+                            print(f"[WARNING] DataFetcher: Zero or negative prices found in {col} of {code}. Replacing with NaN for ffill.")
+                            df.loc[invalid_mask, col] = np.nan
+                    
+                    # Forward-fill (ffill) from last valid price, backward-fill (bfill) as fallback
+                    df[price_cols] = df[price_cols].ffill().bfill()
+                    
+                    # Hard defensive clamp for any remaining NaN/zero prices
+                    for col in price_cols:
+                        still_invalid = df[col].isna() | (df[col] <= 0.0)
+                        if still_invalid.any():
+                            print(f"[WARNING] DataFetcher: Persistent zero/NaN prices after fill in {col} of {code}. Clamping to defensive minimum tick 1e-5.")
+                            df.loc[still_invalid, col] = 1e-5
+                
                 # Phase 2: Implicit Dependency Fetching and Standardized Conversion
                 if base_ccy == 'USD':
                     print("[DEBUG] USD base currency detected. Triggering implicit USD/MYR exchange rate fetch in Facade...")

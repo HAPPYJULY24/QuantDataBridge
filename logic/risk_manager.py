@@ -190,7 +190,14 @@ class RiskManager:
         sizing_equity = min(self.initial_capital, self.state.equity)
         
         risk_amount = sizing_equity * risk_per_trade
-        volatility_value = atr * multiplier
+        
+        # Standardize Risk Distance: Priority to stop_loss_dist, otherwise default to 2.0 * atr
+        if stop_loss_dist > 0.0:
+            risk_distance = stop_loss_dist
+        else:
+            risk_distance = atr * 2.0
+            
+        volatility_value = risk_distance * multiplier
         
         if volatility_value == 0:
             return 0
