@@ -328,12 +328,17 @@ class AlphaTab(QWidget):
         neut_layout.addWidget(self.risk_list)
         
         ridge_layout = QHBoxLayout()
-        ridge_layout.addWidget(QLabel("Ridge Alpha:"))
+        self.ridge_label = QLabel("Ridge Alpha:")
+        ridge_layout.addWidget(self.ridge_label)
         self.ridge_alpha = QDoubleSpinBox()
         self.ridge_alpha.setRange(0, 10)
         self.ridge_alpha.setValue(1.0)
         ridge_layout.addWidget(self.ridge_alpha)
         neut_layout.addLayout(ridge_layout)
+        
+        # Hide Ridge Alpha controls as OLS does not use regularization
+        self.ridge_label.setVisible(False)
+        self.ridge_alpha.setVisible(False)
         
         neut_group.setLayout(neut_layout)
         bottom_layout.addWidget(neut_group)

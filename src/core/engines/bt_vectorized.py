@@ -55,6 +55,12 @@ class VectorizedBacktest:
             Dictionary with aggregate metrics only: metrics, signals.
             Does NOT contain 'trades' or detailed equity_curve.
         """
+        # Normalize execution mode
+        if execution_mode and 'Next Open' in execution_mode:
+            execution_mode = 'Next Open'
+        else:
+            execution_mode = 'Close'
+
         if not pressure_test:
             self.logger.warning(
                 "[VECTORIZED] Called without pressure_test=True. "
@@ -278,7 +284,7 @@ class VectorizedBacktest:
         
         # Transaction Costs
         df['pos_change'] = df['pos'].diff().abs().fillna(0)
-        cost_per_lot = commission + (slippage * multiplier)
+        cost_per_lot = commission
         df['cost'] = df['pos_change'] * cost_per_lot
         df['net_pnl'] = df['gross_pnl'] - df['cost']
         

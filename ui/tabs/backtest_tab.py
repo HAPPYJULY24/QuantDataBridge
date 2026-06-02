@@ -237,8 +237,8 @@ class BacktestTab(QWidget):
         
         # Execution Mode (Phase 5.1)
         self.exec_mode_combo = QComboBox()
-        self.exec_mode_combo.addItems(["Close (T+1)", "Next Open (T+1)"])
-        self.exec_mode_combo.setToolTip("Close: Exec at Close T+1 via Signal T\nNext Open: Exec at Open T+1 via Signal T-1 (Robust)")
+        self.exec_mode_combo.addItems(["Close (T)", "Next Open (T+1)"])
+        self.exec_mode_combo.setToolTip("Close: Exec at Close T via Signal T\nNext Open: Exec at Open T+1 via Signal T (Robust)")
         strat_layout.addRow("Exec Mode:", self.exec_mode_combo)
         
         # Trading Hours

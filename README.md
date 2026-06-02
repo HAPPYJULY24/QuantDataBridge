@@ -42,7 +42,7 @@ Quant Data Bridge is a professional quantitative trading platform that integrate
 ### 🔬 Alpha Factor Lab (v3.0)
 - **Expression-Based Factors**: Python syntax for flexible factor creation
 - **Preprocessing Pipeline**: 3-Sigma, MAD, Quantile winsorization
-- **Risk Factor Neutralization**: Ridge regression with custom alpha
+- **Risk Factor Neutralization**: OLS linear regression (strictly orthogonal)
 - **Multi-Period IC Analysis**: Decay analysis for 1, 3, 5, 10, 20 periods
 - **Quantile Performance**: 5-tier factor distribution analysis
 - **Visualization Suite**: 4 interactive chart types (IC Series, Decay, Quantile, Risk)

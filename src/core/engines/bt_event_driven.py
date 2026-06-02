@@ -81,6 +81,12 @@ class EventDrivenBacktest:
         Returns:
             Dictionary with metrics, equity_curve, signals, audit_log, trades
         """
+        # Normalize execution mode
+        if execution_mode and 'Next Open' in execution_mode:
+            execution_mode = 'Next Open'
+        else:
+            execution_mode = 'Close'
+
         self._emit_log(f"[EVENT-DRIVEN] Starting backtest for {asset_symbol}")
         self._emit_log(f"[CONFIG] Multiplier={multiplier}, Margin={initial_margin}, Capital={initial_capital}")
         

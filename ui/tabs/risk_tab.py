@@ -119,7 +119,13 @@ class RiskWorker(QThread):
 
             # Generate signals once (shared across all tracks)
             from src.core.signal_generator import SignalFactory
-            df['signal'] = SignalFactory.create('Mean Reversion').generate(
+            
+            # Resolve strategy type (supporting both legacy DNA and unified StrategyConfig formats)
+            strategy_type = "Mean Reversion" # 默认安全底线
+            if "backtest_profile" in raw_dna and "settings" in raw_dna["backtest_profile"]:
+                strategy_type = raw_dna["backtest_profile"]["settings"].get("strategy", "Mean Reversion")
+
+            df['signal'] = SignalFactory.create(strategy_type).generate(
                 df, upper_bound=upper_bound, lower_bound=lower_bound)
 
             # Read max_position_size from DNA so BASE track uses the same lot cap
@@ -142,7 +148,7 @@ class RiskWorker(QThread):
 
             # BASE: same max_lots as DNA, but margin=0 & ADX off → pure alpha, no capital constraints
             dummy_cfg = RiskConfig(
-                initial_capital=initial_capital, initial_margin=0.0,
+                initial_capital=1e12, initial_margin=0.0,
                 risk_target_pct=999.0, max_position_size=max_lots,
                 multiplier=multiplier, adx_filter_enabled=False)
             engine1 = BacktestEngine()
