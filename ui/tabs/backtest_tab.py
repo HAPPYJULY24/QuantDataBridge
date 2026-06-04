@@ -2,7 +2,8 @@
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                              QPushButton, QComboBox, QGroupBox, QFormLayout,
                              QDoubleSpinBox, QSplitter, QTableWidget, QTableWidgetItem,
-                             QHeaderView, QMessageBox, QSpinBox, QTabWidget, QCheckBox, QFileDialog)
+                             QHeaderView, QMessageBox, QSpinBox, QTabWidget, QCheckBox,
+                             QFileDialog, QPlainTextEdit, QScrollArea)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QFont, QColor
 import pandas as pd
@@ -55,7 +56,8 @@ class BacktestWorker(QThread):
                     risk_target_pct    = p.get('risk_target', 1.0),
                     max_position_size  = p.get('max_lots', 20),
                     multiplier         = p['multiplier'],
-                    adx_filter_enabled = p.get('use_adx_filter', False)
+                    adx_filter_enabled = p.get('use_adx_filter', False),
+                    sl_pct             = p.get('sl_pct', 0.0)
                 )
                 RMClass = lambda *a, **kw: RMInterceptor(config)
 
@@ -65,7 +67,8 @@ class BacktestWorker(QThread):
                     p.get('strategy', 'Mean Reversion')
                 ).generate(df,
                     upper_bound=p['upper_bound'],
-                    lower_bound=p['lower_bound'])
+                    lower_bound=p['lower_bound'],
+                    signal_logic_code=p.get('signal_logic_code'))
 
                 # ── Run via event_driven.run() — same call-site as Risk Tab ───
                 results = self.engine.event_driven.run(
@@ -81,7 +84,7 @@ class BacktestWorker(QThread):
                     allow_lunch=p['allow_lunch'],
                     allow_overnight=p['allow_overnight'],
                     execution_mode=p.get('execution_mode', 'Close'),
-                    risk_params={'max_lots': p.get('max_lots', 20)}
+                    risk_params={'max_lots': p.get('max_lots', 20), 'sl_pct': p.get('sl_pct', 0.0)}
                 )
 
                 # ── Lookahead audit (fast vectorized sub-run) ─────────────────
@@ -132,13 +135,23 @@ class BacktestTab(QWidget):
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(0, 0, 10, 0)
         
+        # Scroll Area for left settings
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        
+        scroll_widget = QWidget()
+        scroll_layout = QVBoxLayout(scroll_widget)
+        scroll_layout.setContentsMargins(0, 0, 5, 0)
+        
         # Title
         title = QLabel("Backtest Engine")
         font = title.font()
         font.setPointSize(14)
         font.setBold(True)
         title.setFont(font)
-        left_layout.addWidget(title)
+        scroll_layout.addWidget(title)
         
         # 1. Data Selection
         data_group = QGroupBox("Signal Source")
@@ -153,7 +166,7 @@ class BacktestTab(QWidget):
         data_layout.addRow(refresh_btn)
         
         data_group.setLayout(data_layout)
-        left_layout.addWidget(data_group)
+        scroll_layout.addWidget(data_group)
         
         # 2. Market Parameters
         market_group = QGroupBox("Market Params")
@@ -182,15 +195,30 @@ class BacktestTab(QWidget):
         market_layout.addRow("Init Margin (RM):", self.margin_spin)
         
         market_group.setLayout(market_layout)
-        left_layout.addWidget(market_group)
+        scroll_layout.addWidget(market_group)
         
         # 3. Strategy Parameters
         strat_group = QGroupBox("Strategy Params")
         strat_layout = QFormLayout()
         
         self.strategy_combo = QComboBox()
-        self.strategy_combo.addItems(["Mean Reversion", "Momentum Breakout"])
+        self.strategy_combo.addItems(["Mean Reversion", "Momentum Breakout", "Direct Signal"])
         strat_layout.addRow("Strategy Type:", self.strategy_combo)
+        
+        # Signal Logic (Python) Container
+        self.signal_logic_container = QWidget()
+        sl_layout = QVBoxLayout(self.signal_logic_container)
+        sl_layout.setContentsMargins(0, 5, 0, 5)
+        
+        self.signal_logic_label = QLabel("Signal Logic (Python):")
+        self.signal_logic_input = QPlainTextEdit()
+        self.signal_logic_input.setPlaceholderText("Enter Python signal logic, e.g.:\ndf['signal'] = np.where((df['close'] < df['orb_low']) & (df['zscore'] > 1.5), -1, 0)")
+        self.signal_logic_input.setPlainText("df['signal'] = np.where((df['close'] < df['orb_low']) & (df['zscore'] > 1.5), -1, 0)")
+        self.signal_logic_input.setMinimumHeight(150)
+        
+        sl_layout.addWidget(self.signal_logic_label)
+        sl_layout.addWidget(self.signal_logic_input)
+        strat_layout.addRow(self.signal_logic_container)
         
         self.capital_spin = QDoubleSpinBox()
         self.capital_spin.setRange(1000, 10000000)
@@ -198,17 +226,26 @@ class BacktestTab(QWidget):
         self.capital_spin.setSingleStep(1000)
         strat_layout.addRow("Capital (RM):", self.capital_spin)
         
+        # Bounds Container
+        self.bounds_container = QWidget()
+        bounds_layout = QFormLayout(self.bounds_container)
+        bounds_layout.setContentsMargins(0, 0, 0, 0)
+        
+        self.upper_bound_label = QLabel("Upper Bound (>):")
         self.upper_bound = QDoubleSpinBox()
         self.upper_bound.setRange(-10, 10)
         self.upper_bound.setValue(0.5)
         self.upper_bound.setSingleStep(0.1)
-        strat_layout.addRow("Upper Bound (>):", self.upper_bound)
+        bounds_layout.addRow(self.upper_bound_label, self.upper_bound)
         
+        self.lower_bound_label = QLabel("Lower Bound (<):")
         self.lower_bound = QDoubleSpinBox()
         self.lower_bound.setRange(-10, 10)
         self.lower_bound.setValue(-0.5)
         self.lower_bound.setSingleStep(0.1)
-        strat_layout.addRow("Lower Bound (<):", self.lower_bound)
+        bounds_layout.addRow(self.lower_bound_label, self.lower_bound)
+        
+        strat_layout.addRow(self.bounds_container)
         
         # Volatility Targeting (Phase 5.2)
         self.risk_target = QDoubleSpinBox()
@@ -253,9 +290,11 @@ class BacktestTab(QWidget):
         strat_layout.addRow(self.lunch_chk)
         
         strat_group.setLayout(strat_layout)
-        left_layout.addWidget(strat_group)
+        scroll_layout.addWidget(strat_group)
         
-        left_layout.addStretch()
+        scroll_layout.addStretch()
+        scroll_area.setWidget(scroll_widget)
+        left_layout.addWidget(scroll_area)
         
         # Run Button
         self.run_btn = QPushButton("🚀 Run Backtest")
@@ -333,6 +372,10 @@ class BacktestTab(QWidget):
         # Initial refresh
         self.refresh_files()
         
+        # Connect strategy change handler for UI protection
+        self.strategy_combo.currentTextChanged.connect(self._on_strategy_changed)
+        self._on_strategy_changed(self.strategy_combo.currentText())
+        
     def refresh_files(self):
         """Scan datacenter/Alpha_data/"""
         from utils.cache_manager import CacheManager
@@ -362,6 +405,22 @@ class BacktestTab(QWidget):
              self.run_btn.setEnabled(True)
              self.pressure_btn.setEnabled(True)
 
+    def _on_strategy_changed(self, text: str):
+        """Hide upper/lower bounds if Direct Signal strategy is selected, and manage signal logic visibility."""
+        is_direct = (text == "Direct Signal")
+        
+        # Hide/show bounds container and widgets
+        self.bounds_container.setVisible(not is_direct)
+        self.upper_bound_label.setVisible(not is_direct)
+        self.upper_bound.setVisible(not is_direct)
+        self.lower_bound_label.setVisible(not is_direct)
+        self.lower_bound.setVisible(not is_direct)
+        
+        # Manage visibility of custom signal logic container and widgets
+        self.signal_logic_container.setVisible(is_direct)
+        self.signal_logic_label.setVisible(is_direct)
+        self.signal_logic_input.setVisible(is_direct)
+
     def _get_params(self):
         return {
             'multiplier': self.multiplier_spin.value(),
@@ -378,12 +437,18 @@ class BacktestTab(QWidget):
             'risk_target': self.risk_target.value(),
             'sl_pct': self.sl_pct.value(),
             'use_adx_filter': self.adx_chk.isChecked(),
-            'max_lots': self.max_lots.value()
+            'max_lots': self.max_lots.value(),
+            'signal_logic_code': self.signal_logic_input.toPlainText()
         }
 
     def _run_backtest(self):
         filename = self.file_combo.currentText()
         if not filename or filename == "No signals found": return
+        
+        # Intercept empty code in Direct Signal mode
+        if self.strategy_combo.currentText() == "Direct Signal" and not self.signal_logic_input.toPlainText().strip():
+            QMessageBox.warning(self, "参数校验失败", "在 Direct Signal 模式下，必须输入 Signal Logic (Python) 代码。")
+            return
         
         # Pull absolute path from the combo item's hidden data
         path = self.file_combo.currentData()
@@ -437,6 +502,11 @@ class BacktestTab(QWidget):
     def _run_pressure_test(self):
         filename = self.file_combo.currentText()
         if not filename or filename == "No signals found": return
+        
+        # Intercept empty code in Direct Signal mode
+        if self.strategy_combo.currentText() == "Direct Signal" and not self.signal_logic_input.toPlainText().strip():
+            QMessageBox.warning(self, "参数校验失败", "在 Direct Signal 模式下，必须输入 Signal Logic (Python) 代码进行敏感度压力测试。")
+            return
         
         path = self.file_combo.currentData()
         if not path:
@@ -686,7 +756,8 @@ class BacktestTab(QWidget):
                 "exit_threshold": p.get('lower_bound', 0.0),
                 "rebalance_mode": "signal_driven",
                 "order_type": "market",
-                "execution_mode": p.get('execution_mode', 'Close')
+                "execution_mode": p.get('execution_mode', 'Close'),
+                "signal_logic_code": p.get('signal_logic_code', "")
             },
             "execution_constraints": {
                 "allow_overnight": p.get('allow_overnight', True),

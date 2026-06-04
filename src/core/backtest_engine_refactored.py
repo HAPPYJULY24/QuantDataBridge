@@ -71,7 +71,12 @@ class BacktestEngine:
         # 1. Pipeline: Generate Signals
         strategy = risk_params.get('strategy', 'Mean Reversion')
         generator = SignalFactory.create(strategy)
-        df['signal'] = generator.generate(df, upper_bound=upper_bound, lower_bound=lower_bound)
+        df['signal'] = generator.generate(
+            df, 
+            upper_bound=upper_bound, 
+            lower_bound=lower_bound,
+            signal_logic_code=risk_params.get('signal_logic_code')
+        )
         
         # 2. Execution Engine
         return self.event_driven.run(
@@ -106,14 +111,15 @@ class BacktestEngine:
         # Using vectorized backtest here to keep audit fast, as it runs multiple times.
         def _quick_run(data: pd.DataFrame):
             # Pipeline preprocessing
-            strategy = params.get('risk_params', {}).get('strategy', 'Mean Reversion')
+            strategy = params.get('strategy', 'Mean Reversion')
             generator = SignalFactory.create(strategy)
             
             # The signal must be generated FRESH over the given 'data'
             data['signal'] = generator.generate(
                 data, 
                 upper_bound=params.get('upper_bound', 0.5), 
-                lower_bound=params.get('lower_bound', -0.5)
+                lower_bound=params.get('lower_bound', -0.5),
+                signal_logic_code=params.get('signal_logic_code')
             )
             
             return self.vectorized.run(
@@ -130,7 +136,8 @@ class BacktestEngine:
                 risk_target=params.get('risk_target', 0.0),
                 sl_pct=params.get('sl_pct', 0.0),
                 max_lots=params.get('max_lots', 20),
-                pressure_test=True  # Audit uses vectorized as a fast sub-routine
+                pressure_test=True,  # Audit uses vectorized as a fast sub-routine
+                use_adx_filter=params.get('use_adx_filter', False)
             )
             
         base_res = _quick_run(df.copy())
@@ -174,13 +181,14 @@ class BacktestEngine:
         sensitivity_results = []
         slippage_levels = [0, 1, 2, 3, 5, 8] # Slippage in ticks
         
-        strategy = params.get('risk_params', {}).get('strategy', 'Mean Reversion')
+        strategy = params.get('strategy', 'Mean Reversion')
         generator = SignalFactory.create(strategy)
         # Generate signal column ONCE for all slippage runs since signals don't change by slippage
         df['signal'] = generator.generate(
             df, 
             upper_bound=params.get('upper_bound', 0.5), 
-            lower_bound=params.get('lower_bound', -0.5)
+            lower_bound=params.get('lower_bound', -0.5),
+            signal_logic_code=params.get('signal_logic_code')
         )
         
         for s in slippage_levels:
@@ -198,7 +206,8 @@ class BacktestEngine:
                 risk_target=params.get('risk_target', 0.0),
                 sl_pct=params.get('sl_pct', 0.0),
                 max_lots=params.get('max_lots', 20),
-                pressure_test=True  # Hard-bound: only vectorized engine for pressure tests
+                pressure_test=True,  # Hard-bound: only vectorized engine for pressure tests
+                use_adx_filter=params.get('use_adx_filter', False)
             )
             metrics = res['metrics']
             

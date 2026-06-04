@@ -656,7 +656,7 @@ class EventDrivenBacktest:
         
         # === STEP 8: Calculate metrics ===
         equity_series = self._create_equity_series(df)
-        metrics = self._calculate_metrics_from_trades(trades_df, equity_series, initial_capital)
+        metrics = self._calculate_metrics_from_trades(trades_df, equity_series, initial_capital, rm_state=rm.state)
         metrics["Total Trades"] = len(trades_df)
         metrics["Initial Capital"] = initial_capital
         
@@ -775,7 +775,8 @@ class EventDrivenBacktest:
     
     def _calculate_metrics_from_trades(self, trades_df: pd.DataFrame, 
                                        equity_curve: pd.Series, 
-                                       initial_capital: float) -> Dict:
+                                       initial_capital: float,
+                                       rm_state=None) -> Dict:
         """
         Calculate performance metrics using institutional-grade Mark-to-Market (MtM).
         
@@ -796,8 +797,12 @@ class EventDrivenBacktest:
             "Max DD Duration": 0.0,
             "Sharpe Ratio": 0.0,
             "Calmar Ratio": 0.0,
-            "Total Trades": 0
+            "Total Trades": 0,
+            "Margin Status": "Safe"
         }
+        
+        if rm_state and getattr(rm_state, 'is_liquidated', False):
+            metrics["Margin Status"] = rm_state.liquidation_reason
         
         if trades_df.empty:
             return metrics
@@ -837,15 +842,15 @@ class EventDrivenBacktest:
         else:
             daily_equity = eq  # fallback: use as-is
         
-        # --- B2: Max Drawdown (MtM) from equity curve high-water mark ---
-        peak = daily_equity.cummax()
-        drawdown = daily_equity - peak
+        # --- B2: Max Drawdown (MtM) from bar-level equity curve high-water mark ---
+        peak = eq.cummax()
+        drawdown = eq - peak
         drawdown_pct = drawdown / peak
         
         max_dd_pct = abs(drawdown_pct.min()) * 100 if len(drawdown_pct) > 0 else 0.0
         max_dd_val = abs(drawdown.min()) if len(drawdown) > 0 else 0.0
         
-        # MDD Duration (days): longest streak below high-water mark
+        # MDD Duration (bars): longest streak below high-water mark on bar-level
         is_in_dd = drawdown < 0
         dd_groups = (~is_in_dd).cumsum()
         if is_in_dd.any():

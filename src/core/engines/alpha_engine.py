@@ -1172,12 +1172,10 @@ class AlphaEngine:
             'export_clean_rows': len(df_clean),
         }
         
-        # 4. Select Final Columns
+        # 4. Select Final Columns: Export all columns to allow Dynamic Signal Injection (no columns dropped)
         target_cols = ['datetime', 'symbol', 'open', 'high', 'low', 'close', 'volume', 'factor']
-        
-        # Dynamic extraction: if user calculated ret_1, ret_3 etc, carry them over
-        ret_cols = [c for c in df_clean.columns if c.startswith('ret_')]
-        final_cols = [c for c in target_cols if c in df_clean.columns] + ret_cols
+        other_cols = [c for c in df_clean.columns if c not in target_cols]
+        final_cols = [c for c in target_cols if c in df_clean.columns] + other_cols
         
         # Additional custom columns present from original data can be kept or dropped.
         # Keeping only structured data for strict backtest ingestion.

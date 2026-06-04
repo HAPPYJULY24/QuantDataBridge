@@ -26,7 +26,7 @@ class VectorizedBacktest:
             initial_margin: float, maintenance_margin_rate: float = 0.8,
             allow_lunch: bool = True, allow_overnight: bool = True,
             execution_mode: str = 'Close', risk_target: float = 0.02, sl_pct: float = 0.0,
-            max_lots: int = 20, pressure_test: bool = False) -> Dict:
+            max_lots: int = 20, pressure_test: bool = False, use_adx_filter: bool = False) -> Dict:
         """
         Execute vectorized backtest.
 
@@ -50,6 +50,7 @@ class VectorizedBacktest:
             sl_pct: Stop loss percentage (0 = off)
             max_lots: Maximum lots per position
             pressure_test: Set to True when called from run_pressure_test dispatcher
+            use_adx_filter: Set to True to enable ADX regime filtering
         
         Returns:
             Dictionary with aggregate metrics only: metrics, signals.
@@ -101,6 +102,12 @@ class VectorizedBacktest:
             df['signal'] = 0
         df['signal'] = df['signal'].fillna(0).astype(int)
         
+        # Apply ADX Filter if enabled (Bug 5 - only blocks new entries and reversals)
+        if use_adx_filter:
+            prev_sig = df['signal'].shift(1).fillna(0).astype(int)
+            is_new_entry = (df['signal'] != 0) & (df['signal'] != prev_sig)
+            df['signal'] = np.where(is_new_entry & (df['adx'] < 20), 0, df['signal'])
+        
         # 4. Apply Trading Hours Filter
         df = self._filter_trading_hours(df, allow_lunch, allow_overnight)
         
@@ -108,7 +115,7 @@ class VectorizedBacktest:
         df = self._calculate_position_size(df, risk_target, initial_capital, multiplier, max_lots)
         
         # 6. Execution & PnL Logic
-        df = self._calculate_pnl(df, execution_mode, multiplier, sl_pct, commission, slippage, tick_size)
+        df = self._calculate_pnl(df, execution_mode, multiplier, sl_pct, commission, slippage, tick_size, allow_lunch, allow_overnight)
         
         # 7. Equity Curve & Margin (internal only — not exposed in return dict)
         df = self._calculate_equity_and_margin(df, initial_capital, initial_margin, maintenance_margin_rate, tick_size, multiplier, slippage, execution_mode)
@@ -247,7 +254,7 @@ class VectorizedBacktest:
         if risk_target > 0:
             # Volatility-based position sizing
             risk_amount = initial_capital * (risk_target / 100.0)
-            contract_size = df['atr'] * multiplier
+            contract_size = (df['atr'] * 2.0) * multiplier
             contract_size = contract_size.replace(0, np.inf)
             
             lots = risk_amount / contract_size
@@ -261,26 +268,95 @@ class VectorizedBacktest:
         
         return df
     def _calculate_pnl(self, df: pd.DataFrame, execution_mode: str, multiplier: float,
-                       sl_pct: float, commission: float, slippage: float, tick_size: float = 1.0) -> pd.DataFrame:
-        """Calculate PnL with optional stop loss."""
-        # Execution & PnL Logic
+                       sl_pct: float, commission: float, slippage: float, tick_size: float = 1.0,
+                       allow_lunch: bool = True, allow_overnight: bool = True) -> pd.DataFrame:
+        """Calculate PnL with optional stop loss and symmetrical price-embedded slippage."""
+        # Identify force close bars (Bug 6)
+        times = df.index.time
+        force_close_mask = pd.Series(False, index=df.index)
+        if not allow_lunch:
+            lunch_start = pd.Timestamp("12:30").time()
+            force_close_mask |= (times == lunch_start)
+        if not allow_overnight:
+            market_close = pd.Timestamp("18:00").time()
+            night_close = pd.Timestamp("23:30").time()
+            force_close_mask |= (times == market_close) | (times == night_close)
+            
+        # Position Shift Logic
+        df['pos'] = df['pos_raw'].shift(1).fillna(0)
+        # Prevent Next Open time drift: force position to 0 on T+1 if T was force closed
+        prev_force_close = force_close_mask.shift(1).fillna(False)
+        df['pos'] = np.where(prev_force_close, 0, df['pos'])
+
+        df['exit_type'] = 'Signal'
+
+        # 1. Get raw entry price
         if execution_mode == 'Next Open':
-            df['price_change'] = df['open'].shift(-1) - df['open']
-            df['pos'] = df['pos_raw'].shift(1).fillna(0)
+            raw_entry = df['open']
+        else:
+            raw_entry = df['close'].shift(1)
+        
+        # Symmetrical discretization on entry (Bug 3)
+        # Buying price (Long Entry): Ceil((price + slippage) / tick_size) * tick_size
+        # Selling price (Short Entry): Floor((price - slippage) / tick_size) * tick_size
+        df['entry_price'] = np.where(
+            df['pos'] > 0,
+            np.ceil((raw_entry + slippage) / tick_size) * tick_size,
+            np.where(
+                df['pos'] < 0,
+                np.floor((raw_entry - slippage) / tick_size) * tick_size,
+                raw_entry
+            )
+        )
+        
+        # Identify first bar of trade to use entry price
+        position_changed = df['pos'] != df['pos'].shift(1).fillna(0)
+        first_bar_mask = (df['pos'] != 0) & position_changed
+        
+        # Group trade entry prices
+        df['trade_id'] = (df['pos'] != df['pos'].shift(1).fillna(0)).cumsum()
+        entry_prices = df.groupby('trade_id')['entry_price'].transform('first')
+        df['entry_price'] = entry_prices
+        
+        if execution_mode == 'Next Open':
+            standard_ref = df['open']
+        else:
+            standard_ref = df['close'].shift(1)
+            
+        df['ref_price'] = np.where(first_bar_mask, df['entry_price'], standard_ref)
+        
+        # 2. Get current price
+        # Symmetrical exit price logic on force close bars in Next Open mode (Bug 6)
+        if execution_mode == 'Next Open':
+            current_price = np.where(force_close_mask, df['close'], df['open'].shift(-1))
             df['exec_price'] = df['open']
         else:
-            df['price_change'] = df['close'].diff()
-            df['pos'] = df['pos_raw'].shift(1).fillna(0)
+            current_price = df['close']
             df['exec_price'] = df['close']
+            
+        # 3. Identify exit bars (either trade ended, or position size/direction changed)
+        pos_next = df['pos'].shift(-1).fillna(0)
+        is_exit_bar = (df['pos'] != 0) & (pos_next != df['pos'])
         
-        df['exit_type'] = 'Signal'
+        # Discretize exit price on exit bars (Bug 3)
+        # Selling price (Long Exit): Floor((price - slippage) / tick_size) * tick_size
+        # Buying price (Short Exit): Ceil((price + slippage) / tick_size) * tick_size
+        exit_price_discretized = np.where(
+            df['pos'] > 0,
+            np.floor((current_price - slippage) / tick_size) * tick_size,
+            np.where(
+                df['pos'] < 0,
+                np.ceil((current_price + slippage) / tick_size) * tick_size,
+                current_price
+            )
+        )
+        current_price_adjusted = np.where(is_exit_bar, exit_price_discretized, current_price)
         
-        # Stop Loss Logic (Vectorized)
         if sl_pct > 0:
-            df = self._apply_stop_loss(df, sl_pct, multiplier, execution_mode, slippage, tick_size)
+            df = self._apply_stop_loss(df, sl_pct, multiplier, execution_mode, slippage, tick_size, force_close_mask, current_price_adjusted)
         else:
-            # Basic PnL
-            df['gross_pnl'] = df['price_change'] * multiplier * df['pos']
+            # Basic PnL with symmetrical price-embedded slippage
+            df['gross_pnl'] = (current_price_adjusted - df['ref_price']) * multiplier * df['pos']
         
         # Transaction Costs
         df['pos_change'] = df['pos'].diff().abs().fillna(0)
@@ -291,26 +367,62 @@ class VectorizedBacktest:
         return df
     
     def _apply_stop_loss(self, df: pd.DataFrame, sl_pct: float, multiplier: float,
-                          execution_mode: str, slippage: float = 0.0, tick_size: float = 1.0) -> pd.DataFrame:
+                          execution_mode: str, slippage: float = 0.0, tick_size: float = 1.0,
+                          force_close_mask: Optional[pd.Series] = None,
+                          current_price_adjusted: Optional[pd.Series] = None) -> pd.DataFrame:
         """Apply vectorized stop loss logic without look-ahead bias and with symmetrical gap exits."""
-        # 1. Identify trade IDs
+        # Always compute trade_id / entry_price / ref_price to ensure freshness (e.g. if DataFrame reused)
         df['trade_id'] = (df['pos'] != df['pos'].shift(1).fillna(0)).cumsum()
-        
-        # 2. Get entry prices (aligned to correct entry bar price)
+            
         if execution_mode == 'Next Open':
-            df['entry_price'] = df['open']
+            raw_entry = df['open']
         else:
-            df['entry_price'] = df['close'].shift(1)
+            raw_entry = df['close'].shift(1)
         
+        df['entry_price'] = np.where(
+            df['pos'] > 0,
+            np.ceil((raw_entry + slippage) / tick_size) * tick_size,
+            np.where(
+                df['pos'] < 0,
+                np.floor((raw_entry - slippage) / tick_size) * tick_size,
+                raw_entry
+            )
+        )
         entry_prices = df.groupby('trade_id')['entry_price'].transform('first')
         df['entry_price'] = entry_prices
-        
-        # 3. Calculate SL prices
+            
+        position_changed = df['pos'] != df['pos'].shift(1).fillna(0)
+        first_bar_mask = (df['pos'] != 0) & position_changed
+        if execution_mode == 'Next Open':
+            standard_ref = df['open']
+        else:
+            standard_ref = df['close'].shift(1)
+        df['ref_price'] = np.where(first_bar_mask, df['entry_price'], standard_ref)
+
+        if force_close_mask is None:
+            force_close_mask = pd.Series(False, index=df.index)
+            
+        if current_price_adjusted is None:
+            current_price = df['open'].shift(-1) if execution_mode == 'Next Open' else df['close']
+            pos_next = df['pos'].shift(-1).fillna(0)
+            is_exit_bar = (df['pos'] != 0) & (pos_next != df['pos'])
+            exit_price_discretized = np.where(
+                df['pos'] > 0,
+                np.floor((current_price - slippage) / tick_size) * tick_size,
+                np.where(
+                    df['pos'] < 0,
+                    np.ceil((current_price + slippage) / tick_size) * tick_size,
+                    current_price
+                )
+            )
+            current_price_adjusted = np.where(is_exit_bar, exit_price_discretized, current_price)
+
+        # 1. Calculate SL prices
         df['sl_prices'] = np.where(df['pos'] > 0,
                                    df['entry_price'] * (1 - sl_pct/100.0),
                                    df['entry_price'] * (1 + sl_pct/100.0))
         
-        # 4. Identify Signal Generation Bar (Signal Bar)
+        # 2. Identify Signal Generation Bar (Signal Bar)
         # In Close mode, T is signal bar (pos[T]=0, pos[T+1]!=0)
         if execution_mode == 'Close':
             pos_raw = df['pos_raw'] if 'pos_raw' in df.columns else df['pos'].shift(-1).fillna(0)
@@ -318,7 +430,7 @@ class VectorizedBacktest:
         else:
             signal_bar_mask = pd.Series(False, index=df.index)
         
-        # 5. Check for hits with look-ahead bias eliminated (Signal Bar is exempted, First Holding Bar is checked!)
+        # 3. Check for hits with look-ahead bias eliminated (Signal Bar is exempted, First Holding Bar is checked!)
         if execution_mode == 'Close':
             hit_long = (df['pos'] > 0) & (df['low'] < df['sl_prices']) & (~signal_bar_mask)
             hit_short = (df['pos'] < 0) & (df['high'] > df['sl_prices']) & (~signal_bar_mask)
@@ -328,7 +440,7 @@ class VectorizedBacktest:
             
         df['is_sl_triggered'] = hit_long | hit_short
         
-        # 6. Cumulative hits per trade to stop out subsequent bars
+        # 4. Cumulative hits per trade to stop out subsequent bars
         is_hit = df['is_sl_triggered']
         cum_hits = pd.Series(is_hit, index=df.index).groupby(df['trade_id']).cumsum()
         first_hit_mask = (cum_hits == 1) & (is_hit)
@@ -341,18 +453,10 @@ class VectorizedBacktest:
         # Apply stop-out to subsequent bars (position goes to 0)
         df.loc[post_hit_mask, 'pos'] = 0
         
-        # 7. Reference price logic (dynamic ref price)
-        position_changed = df['pos'] != df['pos'].shift(1).fillna(0)
-        first_bar_mask = (df['pos'] != 0) & position_changed
+        # 5. Symmetrical Discretization on stop exits (Bug 3)
+        sl_exit_long = np.floor((df['sl_prices'] - slippage) / tick_size) * tick_size
+        sl_exit_short = np.ceil((df['sl_prices'] + slippage) / tick_size) * tick_size
         
-        if execution_mode == 'Next Open':
-            standard_ref = df['open']
-        else:
-            standard_ref = df['close'].shift(1)
-            
-        df['ref_price'] = np.where(first_bar_mask, df['entry_price'], standard_ref)
-        
-        # 8. Symmetrical Discretization on Vectorized Open Gap Exits
         if execution_mode == 'Next Open':
             # Long Exit Gap (Sell) floor discretization
             sl_gap_long_exit = np.floor((df['open'] - slippage) / tick_size) * tick_size
@@ -361,15 +465,14 @@ class VectorizedBacktest:
             
             sl_exit_prices = np.where(
                 df['pos'] > 0,
-                np.where(df['open'] < df['sl_prices'], sl_gap_long_exit, df['sl_prices']),
-                np.where(df['open'] > df['sl_prices'], sl_gap_short_exit, df['sl_prices'])
+                np.where(df['open'] < df['sl_prices'], sl_gap_long_exit, sl_exit_long),
+                np.where(df['open'] > df['sl_prices'], sl_gap_short_exit, sl_exit_short)
             )
         else:
-            sl_exit_prices = df['sl_prices']
+            sl_exit_prices = np.where(df['pos'] > 0, sl_exit_long, sl_exit_short)
             
         # Calculate standard and stop PnL
-        current_price = df['open'].shift(-1) if execution_mode == 'Next Open' else df['close']
-        df['normal_pnl'] = (current_price - df['ref_price']) * multiplier * df['pos']
+        df['normal_pnl'] = (current_price_adjusted - df['ref_price']) * multiplier * df['pos']
         df['sl_pnl'] = (sl_exit_prices - df['ref_price']) * multiplier * df['pos']
         
         # Assemble final gross PnL
@@ -501,7 +604,7 @@ class VectorizedBacktest:
         final_equity = df['equity'].iloc[-1] if not df.empty else initial_capital
         total_trades = df[df['pos_change'] > 0].shape[0]
         
-        # Drawdown
+        # Drawdown - directly on raw bar-by-bar df['equity'] (Bug 8)
         df['peak'] = df['equity'].cummax()
         df['drawdown'] = df['equity'] - df['peak']
         df['drawdown_pct'] = df['drawdown'] / df['peak']
@@ -509,16 +612,18 @@ class VectorizedBacktest:
         max_drawdown_rm = df['drawdown'].min()
         max_drawdown_pct = df['drawdown_pct'].min()
         
-        # Sharpe Ratio (daily)
-        daily_pnl = df['net_pnl'].resample('D').sum() if len(df) > 2 else pd.Series(dtype=float)
-        daily_pnl = daily_pnl[daily_pnl != 0]
-        
-        if len(daily_pnl) > 1:
-            mean_ret = daily_pnl.mean()
-            std_ret = daily_pnl.std()
+        # Sharpe Ratio (daily returns, annualized √252) (Bug 9)
+        if isinstance(df.index, pd.DatetimeIndex) and len(df) > 2:
+            daily_equity = df['equity'].resample('D').last()
+            daily_ret = daily_equity.pct_change().fillna(0)
+            mean_ret = daily_ret.mean()
+            std_ret = daily_ret.std()
             sharpe = (mean_ret / std_ret) * np.sqrt(252) if std_ret != 0 else 0.0
         else:
-            sharpe = 0.0
+            daily_ret = df['equity'].pct_change().fillna(0)
+            mean_ret = daily_ret.mean()
+            std_ret = daily_ret.std()
+            sharpe = (mean_ret / std_ret) * np.sqrt(252) if std_ret != 0 else 0.0
         
         # Calmar Ratio
         days = (df.index[-1] - df.index[0]).days if len(df) > 1 else 1
@@ -535,8 +640,8 @@ class VectorizedBacktest:
         
         return {
             "Total Net Profit": round(total_net_profit, 2),
-            "Max Drawdown (RM)": round(max_drawdown_rm, 2),
-            "Max Drawdown %": round(max_drawdown_pct * 100, 2),
+            "Max Drawdown (RM)": round(abs(max_drawdown_rm), 2),
+            "Max Drawdown %": round(abs(max_drawdown_pct) * 100, 2),
             "Sharpe Ratio": round(sharpe, 3),
             "Calmar Ratio": round(calmar, 3),
             "Total Trades": total_trades,

@@ -1,4 +1,5 @@
 import pandas as pd
+import numpy as np
 from abc import ABC, abstractmethod
 
 class BaseSignalGenerator(ABC):
@@ -70,6 +71,57 @@ class MomentumBreakoutGenerator(BaseSignalGenerator):
         signals.loc[factor < lower_bound] = -1
         return signals
 
+class DirectSignalGenerator(BaseSignalGenerator):
+    """
+    Direct Signal Logic (Pass-Through):
+    - Runs custom Python expression if `signal_logic_code` is provided.
+    - Otherwise, falls back to default hardcoded thresholds:
+      - Long (1) when factor >= 0.5
+      - Short (-1) when factor <= -0.5
+      - Flat (0) otherwise
+    """
+    def generate(self, df: pd.DataFrame, **kwargs) -> pd.Series:
+        signal_code = kwargs.get('signal_logic_code', None)
+        
+        # Guard/fallback: if code is empty or not a string, use default logic
+        if not signal_code or not isinstance(signal_code, str):
+            factor = df.get('factor', pd.Series(0.0, index=df.index)).fillna(0.0).astype(float)
+            signals = pd.Series(
+                np.select(
+                    [factor >= 0.5, factor <= -0.5],
+                    [1, -1],
+                    default=0
+                ),
+                index=df.index
+            )
+            return signals
+
+        # 1. Copy and Pre-initialize 'signal' column
+        df_copy = df.copy()
+        df_copy['signal'] = 0.0
+        
+        # 2. Namespace Injection: pass np and pd, restrict builtins
+        local_env = {
+            'df': df_copy,
+            'np': np,
+            'pd': pd
+        }
+        
+        # 3. PyQt friendly Exception Handling
+        try:
+            exec(signal_code, {'__builtins__': {}}, local_env)
+        except Exception as e:
+            # Raise a clean ValueError so the UI worker logs it clearly
+            raise ValueError(f"动态信号代码执行失败，请检查语法或列名！\n详细错误: {str(e)}") from e
+            
+        df_result = local_env.get('df', df_copy)
+        if 'signal' not in df_result.columns:
+            raise ValueError("动态信号代码执行失败！代码中未对 df['signal'] 进行赋值。")
+            
+        # 4. Post-execution safety/defense
+        signals = df_result['signal'].fillna(0.0).astype(float).astype(int)
+        return pd.Series(np.clip(signals, -1, 1), index=df.index)
+
 class SignalFactory:
     """
     Factory to resolve strategy names to Generator instances.
@@ -77,7 +129,8 @@ class SignalFactory:
     
     _registry = {
         'Mean Reversion': MeanReversionGenerator,
-        'Momentum Breakout': MomentumBreakoutGenerator
+        'Momentum Breakout': MomentumBreakoutGenerator,
+        'Direct Signal': DirectSignalGenerator
     }
     
     @classmethod
