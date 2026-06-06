@@ -163,11 +163,34 @@ class RiskWorker(QThread):
                 multiplier=multiplier, adx_filter_enabled=False)
             engine1 = BacktestEngine()
             base_kwargs = dict(common_kwargs)
+            base_kwargs['initial_capital'] = 1e12  # Align with dummy_cfg to avoid instant Peak Drawdown breach
             base_kwargs['risk_params'] = {'max_lots': max_lots}  # BASE: no SL/TP
             base_results = engine1.event_driven.run(
                 df=df.copy(), asset_symbol="BASE",
                 RiskManagerClass=lambda *a, **kw: RMInterceptor(dummy_cfg),
                 **base_kwargs)
+
+            # Scale Base equity curve back to original initial_capital for visualization & metrics
+            if 'equity_curve' in base_results and not base_results['equity_curve'].empty:
+                base_results['equity_curve']['equity'] = (
+                    base_results['equity_curve']['equity'] - 1e12
+                ) + initial_capital
+                
+                # Recalculate Drawdown and Calmar % of Base relative to original initial_capital
+                eq = base_results['equity_curve']['equity']
+                peak = eq.cummax()
+                drawdown = eq - peak
+                drawdown_pct = drawdown / peak
+                max_dd_pct = abs(drawdown_pct.min()) * 100 if len(drawdown_pct) > 0 else 0.0
+                
+                base_results['metrics']['Max Drawdown'] = round(max_dd_pct, 2)
+                base_results['metrics']['Max Drawdown (%)'] = round(max_dd_pct, 2)
+                
+                if max_dd_pct > 0:
+                    total_days = (eq.index[-1] - eq.index[0]).days if isinstance(eq.index, pd.DatetimeIndex) else 0
+                    if total_days > 0 and eq.iloc[-1] > 0:
+                        cagr = (eq.iloc[-1] / initial_capital) ** (365.25 / total_days) - 1
+                        base_results['metrics']['Calmar Ratio'] = round((cagr * 100) / max_dd_pct, 2)
 
             # ── Track 2: Original DNA Run ────────────────────────────
             auth_cfg = RiskConfig.from_dna(self.dna_path)
@@ -573,6 +596,9 @@ class RiskTab(QWidget):
             self.run_btn.setEnabled(False)
             return
 
+        import os
+        json_files = sorted(json_files, key=os.path.getmtime, reverse=True)
+
         try:
             with open(json_files[0], 'r', encoding='utf-8') as f:
                 raw_dna = json.load(f)
@@ -787,6 +813,8 @@ class RiskTab(QWidget):
             QMessageBox.critical(self, "Error", "No DNA json found.")
             return
 
+        import os
+        json_files = sorted(json_files, key=os.path.getmtime, reverse=True)
         dna_path = str(json_files[0])
 
         # Resolve signal parquet
@@ -815,13 +843,25 @@ class RiskTab(QWidget):
         signal_path = None
         # 1. 必须且仅在匹配的 Backtest_data 策略文件夹中寻找 Parquet 文件 (保证单目录聚拢读取，严禁跨至 Alpha_data 越权嗅探)
         if dc_path.exists():
-            parquets = list(dc_path.glob("signals.parquet"))
-            if not parquets:
-                parquets = list(dc_path.glob("*_data.parquet"))
-            if not parquets:
-                parquets = list(dc_path.glob("*.parquet"))
-            if parquets:
-                signal_path = str(parquets[0])
+            import re
+            dna_name = Path(dna_path).name
+            # Regex to capture parameter hash + timestamp suffix
+            match = re.search(r"_([a-f0-9]{8}_\d{8}_\d{6}_\d{6})\.json$", dna_name)
+            if match:
+                suffix_pattern = match.group(1)
+                parquets = list(dc_path.glob(f"*{suffix_pattern}.parquet"))
+                if parquets:
+                    signal_path = str(parquets[0])
+                    
+            if not signal_path:
+                parquets = list(dc_path.glob("signals.parquet"))
+                if not parquets:
+                    parquets = list(dc_path.glob("*_data.parquet"))
+                if not parquets:
+                    parquets = list(dc_path.glob("*.parquet"))
+                if parquets:
+                    parquets = sorted(parquets, key=os.path.getmtime, reverse=True)
+                    signal_path = str(parquets[0])
                 
         # 2. 如果策略文件夹中未找到 (如历史遗留的旧策略)，则安全降级到对齐行情匹配逻辑 (在 RawData/alignment 搜索)
         if not signal_path:

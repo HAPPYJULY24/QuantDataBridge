@@ -614,13 +614,8 @@ class BacktestTab(QWidget):
                 
                 stg_id = config.metadata.strategy_id
                 
-                # Suffix generation using parameter MD5 hash and high-precision timestamp
-                import hashlib
-                from datetime import datetime
-                param_str = "_".join(f"{k}={v}" for k, v in sorted(self._last_run_params.items()) if isinstance(v, (int, float, str)))
-                param_hash = hashlib.md5(param_str.encode('utf-8')).hexdigest()[:8]
-                timestamp_suffix = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-                suffix = f"_{param_hash}_{timestamp_suffix}"
+                # Suffix generation is disabled to overwrite previous runs and simplify file names
+                suffix = ""
                 
                 # 5. Save modern config `{stg_id}_config_{suffix}.json` inside Backtest_data
                 config.to_json(str(target_dir / f"{stg_id}_config{suffix}.json"))
