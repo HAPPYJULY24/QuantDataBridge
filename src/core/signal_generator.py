@@ -97,7 +97,10 @@ class DirectSignalGenerator(BaseSignalGenerator):
             return signals
 
         from src.core.ast_validator import verify_expression_safety
-        verify_expression_safety(signal_code)
+        try:
+            verify_expression_safety(signal_code)
+        except Exception as e:
+            raise ValueError(f"动态信号代码执行失败，请检查语法或列名！\n详细错误: {str(e)}") from e
 
         # 1. Copy and Pre-initialize 'signal' column
         df_copy = df.copy()

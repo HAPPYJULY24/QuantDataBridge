@@ -344,11 +344,11 @@ class DataProcessor:
 
     def _normalize_df_timezone(self, df: pd.DataFrame, symbol: str) -> pd.DataFrame:
         """
-        Restore naive datetime index to symbol's physical timezone,
+        Standardize naive datetime index to the database baseline timezone (Asia/Kuala_Lumpur),
         and convert to UTC baseline for accurate, leakage-free matching.
         """
         df = df.copy()
-        physical_tz = pytz.timezone(self._get_timezone_for_symbol(symbol))
+        db_tz = pytz.timezone('Asia/Kuala_Lumpur')
         
         # Ensure DatetimeIndex
         if not isinstance(df.index, pd.DatetimeIndex):
@@ -356,11 +356,11 @@ class DataProcessor:
             
         # Localize if naive, otherwise convert
         if df.index.tz is None:
-            df.index = df.index.tz_localize(physical_tz)
-            print(f"[Timezone Normalize] Localized naive index of {symbol} to {physical_tz}")
+            df.index = df.index.tz_localize(db_tz)
+            print(f"[Timezone Normalize] Localized naive index of {symbol} to database timezone {db_tz}")
         else:
-            df.index = df.index.tz_convert(physical_tz)
-            print(f"[Timezone Normalize] Converted index of {symbol} to {physical_tz}")
+            df.index = df.index.tz_convert(db_tz)
+            print(f"[Timezone Normalize] Converted index of {symbol} to database timezone {db_tz}")
             
         # Convert to UTC for matching parity
         df.index = df.index.tz_convert('UTC')
@@ -542,12 +542,12 @@ class DataProcessor:
         merged_df = pd.concat([df_a, df_b], axis=1, join='outer')
         print(f"[DataProcessor] ✅ 合并完成: {len(merged_df)} 行\n")
         
+        # 7.5 添加 overlap 标记 (在 ffill 之前计算，防止 ffill 填充 Close 列导致 is_overlap 标记失真)
+        merged_df = self._add_generic_overlap_flag(merged_df, symbol_a, symbol_b)
+
         # 8. 🔥 Killer Fix 3: 限制价格的前向填充 (ffill) 与成交量 0 填充保护
         if apply_ffill:
             merged_df = self._apply_forward_fill(merged_df, symbol_a, symbol_b, ffill_asset)
-        
-        # 9. 添加 overlap 标记
-        merged_df = self._add_generic_overlap_flag(merged_df, symbol_a, symbol_b)
         
         # 9.5 可选: 仅保留重叠时段
         if only_overlap and 'is_overlap' in merged_df.columns:
@@ -582,6 +582,8 @@ class DataProcessor:
         
         # 13. 生成预览 DataFrame (前50 + 后50行)
         preview_df = self._generate_preview(merged_df)
+        
+        return merged_df, preview_df
         
 
     
@@ -899,6 +901,15 @@ class DataProcessor:
         merged_df = pd.concat(dfs, axis=1, join='outer')
         print(f"[DataProcessor] ✅ 合并完成: {len(merged_df)} 行\n")
         
+        # 3.5 多源 overlap 标记 (在 ffill 之前计算，防止 ffill 填充 Close 列导致 is_overlap 标记失真)
+        close_cols = [f"{s}_Close" for s in symbols if f"{s}_Close" in merged_df.columns]
+        if close_cols:
+            merged_df['is_overlap'] = merged_df[close_cols].notna().all(axis=1)
+            overlap_count = int(merged_df['is_overlap'].sum())
+            print(f"[Overlap] 重叠时间段: {overlap_count} / {len(merged_df)} ({overlap_count/len(merged_df)*100:.1f}%)\n")
+        else:
+            merged_df['is_overlap'] = False
+
         # 4. 🔥 Killer Fix 3: 对非 Anchor 资产执行价格 ffill (成交量 0 填充保护)
         anchor_symbol = symbols[anchor_index]
         if apply_ffill:
@@ -918,15 +929,6 @@ class DataProcessor:
                         merged_df[vol_col] = merged_df[vol_col].fillna(0.0)
                         print(f"  ✅ 保护成交量 {symbol}")
             print()
-        
-        # 5. 多源 overlap 标记 (所有 Close 列都有数据 = True)
-        close_cols = [f"{s}_Close" for s in symbols if f"{s}_Close" in merged_df.columns]
-        if close_cols:
-            merged_df['is_overlap'] = merged_df[close_cols].notna().all(axis=1)
-            overlap_count = int(merged_df['is_overlap'].sum())
-            print(f"[Overlap] 重叠时间段: {overlap_count} / {len(merged_df)} ({overlap_count/len(merged_df)*100:.1f}%)\n")
-        else:
-            merged_df['is_overlap'] = False
         
         # 6. 可选: 仅保留重叠时间段
         if only_overlap and 'is_overlap' in merged_df.columns:

@@ -235,3 +235,95 @@ def test_resilient_lunch_filter_boundaries():
     assert pd.Timestamp('2026-05-28 12:40:00') in fut_dates.values
     assert pd.Timestamp('2026-05-28 13:00:00') not in fut_dates.values
     assert pd.Timestamp('2026-05-28 12:44:00') in fut_dates.values
+
+
+def test_is_overlap_not_polluted_by_ffill():
+    """
+    Verify that overlap calculation is done BEFORE forward-fill is applied,
+    so that forward-filled price values do not trick the algorithm into marking
+    non-overlapping timeframes as overlapping (is_overlap = True).
+    """
+    import shutil
+    from pathlib import Path
+    
+    # 1. Setup temp workspace scratch paths
+    temp_dir = Path("scratch/temp_overlap_test")
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    
+    # DataProcessor configuration for testing
+    processor = DataProcessor(store_dir=str(temp_dir), output_dir=str(temp_dir))
+    
+    try:
+        # Create Dummy Data A (3 rows)
+        dates_a = pd.date_range("2026-05-01 09:00:00", periods=3, freq="h")
+        df_a = pd.DataFrame({
+            'Open': [10.0, 11.0, 12.0],
+            'High': [10.5, 11.5, 12.5],
+            'Low': [9.5, 10.5, 11.5],
+            'Close': [10.0, 11.0, 12.0],
+            'Volume': [100.0, 150.0, 200.0]
+        }, index=dates_a)
+        
+        # Create Dummy Data B (only 2 rows, T3 is missing/NaN)
+        dates_b = pd.date_range("2026-05-01 09:00:00", periods=2, freq="h")
+        df_b = pd.DataFrame({
+            'Open': [5.0, 6.0],
+            'High': [5.5, 6.5],
+            'Low': [4.5, 5.5],
+            'Close': [5.0, 6.0],
+            'Volume': [50.0, 60.0]
+        }, index=dates_b)
+        
+        # Write to temporary parquet files
+        file_a_path = temp_dir / "FCPO-TEST-A_1h.parquet"
+        file_b_path = temp_dir / "FCPO-TEST-B_1h.parquet"
+        
+        df_a.to_parquet(file_a_path)
+        df_b.to_parquet(file_b_path)
+        
+        # 2. Perform custom dual file alignment with ffill enabled
+        full_df, _ = processor.align_custom_files(
+            file_path_a=str(file_a_path),
+            file_path_b=str(file_b_path),
+            apply_ffill=True,
+            ffill_asset='both'
+        )
+        
+        # Let's verify results:
+        # T1 (09:00:00): Both have real data -> is_overlap = True
+        # T2 (10:00:00): Both have real data -> is_overlap = True
+        # T3 (11:00:00): B has no real data (but Close is ffilled to 6.0) -> is_overlap = False
+        full_df.set_index('Date', inplace=True)
+        
+        # Convert index to native datetime to locate
+        t1 = pd.Timestamp('2026-05-01 09:00:00')
+        t2 = pd.Timestamp('2026-05-01 10:00:00')
+        t3 = pd.Timestamp('2026-05-01 11:00:00')
+        
+        # Check values
+        assert full_df.loc[t1, 'is_overlap'] == True
+        assert full_df.loc[t2, 'is_overlap'] == True
+        assert full_df.loc[t3, 'is_overlap'] == False, \
+            "is_overlap at T3 should be False because B has no original data at T3!"
+            
+        # Verify that B's Close at T3 WAS forward filled to 6.0 (proving ffill worked)
+        assert full_df.loc[t3, 'FCPO-TEST-B_Close'] == 6.0
+        
+        # 3. Perform multi file alignment with ffill enabled
+        full_df_multi, _ = processor.align_multi_files(
+            file_paths=[str(file_a_path), str(file_b_path)],
+            anchor_index=0,
+            apply_ffill=True
+        )
+        full_df_multi.set_index('Date', inplace=True)
+        
+        assert full_df_multi.loc[t1, 'is_overlap'] == True
+        assert full_df_multi.loc[t2, 'is_overlap'] == True
+        assert full_df_multi.loc[t3, 'is_overlap'] == False, \
+            "is_overlap in multi-align at T3 should be False because B has no original data at T3!"
+            
+    finally:
+        # Clean up temp folder
+        if temp_dir.exists():
+            shutil.rmtree(temp_dir)
+
