@@ -14,6 +14,10 @@ import matplotlib.dates as mdates
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 import os
 from pathlib import Path
+import io
+import base64
+import hashlib
+import html
 
 # Set backend to avoid issues
 matplotlib.use('QtAgg')
@@ -400,16 +404,33 @@ class AlphaTab(QWidget):
         scroll_area.setWidget(left_container)
         scroll_area.setMinimumWidth(450) # Force a minimum width to prevent UI clipping
         
+        # === Right Panel ===
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        
+        top_bar = QHBoxLayout()
+        top_bar.addStretch()
+        
+        self.report_btn = QPushButton("📋 Export Factor Report")
+        self.report_btn.setEnabled(False)
+        self.report_btn.setStyleSheet(
+            "background:#2E7D32; color:#B0BEC5; padding:4px 10px; border-radius:4px; font-weight:bold;")
+        self.report_btn.clicked.connect(self._export_complete_report)
+        top_bar.addWidget(self.report_btn)
+        right_layout.addLayout(top_bar)
+        
         # === Right Panel: Charts Widget (Phase 5B.3: Extracted) ===
         self.charts = AlphaCharts()
+        right_layout.addWidget(self.charts)
         
         # === Metrics KPI Panel (BUG-1 fix: was dead code, now wired up) ===
         self._setup_metrics_panel()
         
-        # === Main Layout: Split view (Left Controls + Right Charts) ===
+        # === Main Layout: Split view (Left Controls + Right Panel) ===
         main_splitter = QSplitter(Qt.Orientation.Horizontal)
         main_splitter.addWidget(scroll_area)  # Left panel
-        main_splitter.addWidget(self.charts)  # Right panel (extracted widget)
+        main_splitter.addWidget(right_panel)  # Right panel
         main_splitter.setStretchFactor(0, 2)  # Left panel smaller
         main_splitter.setStretchFactor(1, 3)  # Right panel larger (charts)
         
@@ -708,6 +729,9 @@ class AlphaTab(QWidget):
         self._set_loading_state(True)
         self.export_button.setEnabled(False)
         self.save_signal_button.setEnabled(False)
+        self.report_btn.setEnabled(False)
+        self.report_btn.setStyleSheet(
+            "background:#2E7D32; color:#B0BEC5; padding:4px 10px; border-radius:4px; font-weight:bold;")
         self.current_result = None
         
         self.current_worker = AlphaWorker(data_path, expression, config, periods)
@@ -719,6 +743,9 @@ class AlphaTab(QWidget):
     def _on_worker_error(self, message):
         self._set_loading_state(False)
         self._log(f"ERROR: {message}")
+        self.report_btn.setEnabled(False)
+        self.report_btn.setStyleSheet(
+            "background:#2E7D32; color:#B0BEC5; padding:4px 10px; border-radius:4px; font-weight:bold;")
         
         # Create an explicit QMessageBox object for a professional warning interface
         msg_box = QMessageBox(self)
@@ -783,6 +810,9 @@ class AlphaTab(QWidget):
         self._set_loading_state(False)
         self.export_button.setEnabled(True)
         self.save_signal_button.setEnabled(True)
+        self.report_btn.setEnabled(True)
+        self.report_btn.setStyleSheet(
+            "background:#2E7D32; color:white; padding:4px 10px; border-radius:4px; font-weight:bold;")
         
         QMessageBox.information(self, "Success", "Alpha pipeline executed successfully!")
 
@@ -1314,3 +1344,377 @@ class AlphaTab(QWidget):
             )
         except Exception as e:
              QMessageBox.critical(self, "Export Error", str(e))
+
+    def _export_complete_report(self):
+        if not self.current_result:
+            QMessageBox.warning(self, "No Data", "Please run the analysis pipeline first.")
+            return
+
+        from PyQt6.QtWidgets import QFileDialog
+        from datetime import datetime
+        import html
+        import re
+        import hashlib
+        import io
+        import base64
+
+        # 1. Gather inputs
+        file_text = self.data_combo.currentText()
+        target_return_col = self.target_return_combo.currentText()
+        only_overlap = self.only_overlap_chk.isChecked()
+        factor_expr = self.expression_input.toPlainText().strip()
+        winsor_method = self.method_combo.currentText()
+        quantile_lb = self.quantile_lb.value()
+        quantile_ub = self.quantile_ub.value()
+        auto_drop_zero_vol = self.auto_drop_chk.isChecked()
+        risk_factors = self._checked_risk_factors()
+        
+        # 2. Parse data info from label
+        data_audit_html = self.info_label.text()
+        
+        # 3. Generate MD5 Fingerprint
+        params_str = f"expr={factor_expr}&winsor={winsor_method}&qlb={quantile_lb}&qub={quantile_ub}&autodrop={auto_drop_zero_vol}&overlap={only_overlap}&risks={','.join(risk_factors)}&target={target_return_col}"
+        md5_hash = hashlib.md5(params_str.encode('utf-8')).hexdigest()[:8].upper()
+        
+        # 4. Resolve default filename
+        clean_universe = re.sub(r'\[.*?\]', '', file_text).strip()
+        clean_universe = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in clean_universe).strip("_")
+        if not clean_universe:
+            clean_universe = "Alpha"
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_filename = f"AlphaReport_{clean_universe}_{md5_hash}_{timestamp}.html"
+        
+        save_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Factor Report",
+            default_filename,
+            "HTML Files (*.html)"
+        )
+        if not save_path:
+            return
+
+        # Disable cursor during export rendering
+        QApplication.setOverrideCursor(QCursor(Qt.CursorShape.WaitCursor))
+        
+        try:
+            # 5. Convert plots to Base64
+            def get_base64_img(fig):
+                buf = io.BytesIO()
+                fig.savefig(buf, format='png', bbox_inches='tight', dpi=100, facecolor=fig.get_facecolor())
+                buf.seek(0)
+                img_data = base64.b64encode(buf.read()).decode('utf-8')
+                buf.close()
+                return img_data
+
+            ic_img = get_base64_img(self.charts.ic_figure)
+            decay_img = get_base64_img(self.charts.decay_figure)
+            q_img = get_base64_img(self.charts.q_figure)
+            q_cum_img = get_base64_img(self.charts.q_cum_figure)
+            risk_img = get_base64_img(self.charts.risk_figure)
+            turnover_img = get_base64_img(self.charts.turnover_figure)
+            autocorr_img = get_base64_img(self.charts.autocorr_figure)
+
+            # 6. Extract KPI table records
+            kpi_rows = []
+            for r in range(self.metrics_table.rowCount()):
+                m_name = self.metrics_table.item(r, 0).text() if self.metrics_table.item(r, 0) else ""
+                m_val = self.metrics_table.item(r, 1).text() if self.metrics_table.item(r, 1) else ""
+                m_desc = self.metrics_table.item(r, 2).text() if self.metrics_table.item(r, 2) else ""
+                m_rating = self.metrics_table.item(r, 3).text() if self.metrics_table.item(r, 3) else ""
+                
+                rating_color_class = "neutral"
+                item_rating = self.metrics_table.item(r, 3)
+                if item_rating and item_rating.background().color().isValid():
+                    r_color = item_rating.background().color().name().lower()
+                    if r_color in ['#4caf50', '#326432', '#8bc34a']:
+                        rating_color_class = "pass"
+                    elif r_color in ['#f44336', '#643232']:
+                        rating_color_class = "fail"
+                    elif r_color in ['#ff9800']:
+                        rating_color_class = "warning"
+                kpi_rows.append({
+                    "name": m_name,
+                    "value": m_val,
+                    "desc": m_desc,
+                    "rating": m_rating,
+                    "color_class": rating_color_class
+                })
+
+            kpi_table_html = ""
+            for row in kpi_rows:
+                kpi_table_html += f"""
+                <tr>
+                    <td><b>{row['name']}</b></td>
+                    <td>{row['value']}</td>
+                    <td>{row['desc']}</td>
+                    <td><span class="badge {row['color_class']}">{row['rating']}</span></td>
+                </tr>
+                """
+
+            # 7. Construct HTML Report Content
+            safe_expr = html.escape(factor_expr)
+            risk_factors_str = ", ".join(risk_factors) if risk_factors else "None (No Neutralization)"
+            current_period = self.period_combo.currentText() or "current"
+            
+            html_content = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Alpha Factor Research Report - {clean_universe}</title>
+    <style>
+        :root {{
+            --bg-color: #0d1117;
+            --card-bg: #161b22;
+            --border-color: #30363d;
+            --text-color: #c9d1d9;
+            --text-muted: #8b949e;
+            --primary: #4CAF50;
+            --primary-muted: rgba(76, 175, 80, 0.15);
+            --accent: #2196F3;
+            --accent-muted: rgba(33, 150, 243, 0.15);
+            --warning: #ff9800;
+            --warning-muted: rgba(255, 152, 0, 0.15);
+            --danger: #f44336;
+            --danger-muted: rgba(244, 67, 54, 0.15);
+        }}
+        body {{
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            margin: 0;
+            padding: 40px 20px;
+            line-height: 1.6;
+        }}
+        .container {{
+            max-width: 1200px;
+            margin: 0 auto;
+        }}
+        header {{
+            border-bottom: 2px solid var(--border-color);
+            padding-bottom: 20px;
+            margin-bottom: 30px;
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-end;
+        }}
+        .header-title h1 {{
+            margin: 0;
+            font-size: 28px;
+            color: #ffffff;
+            font-weight: 700;
+            letter-spacing: -0.5px;
+        }}
+        .header-title p {{
+            margin: 5px 0 0 0;
+            color: var(--text-muted);
+            font-size: 14px;
+        }}
+        .fingerprint {{
+            font-family: monospace;
+            background-color: #1f242c;
+            padding: 4px 8px;
+            border-radius: 4px;
+            border: 1px solid var(--border-color);
+            color: var(--accent);
+        }}
+        .grid-2 {{
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            margin-bottom: 30px;
+        }}
+        .card {{
+            background-color: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 20px;
+            position: relative;
+        }}
+        .card h2 {{
+            margin: 0 0 15px 0;
+            font-size: 18px;
+            font-weight: 600;
+            color: #ffffff;
+        }}
+        .code-block {{
+            background-color: #090c10;
+            border: 1px solid var(--border-color);
+            padding: 15px;
+            border-radius: 6px;
+            font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, Courier, monospace;
+            font-size: 13px;
+            color: #ff7b72;
+            word-break: break-all;
+            white-space: pre-wrap;
+            margin: 10px 0;
+        }}
+        table {{
+            width: 100%;
+            border-collapse: collapse;
+            margin: 15px 0;
+            font-size: 13px;
+        }}
+        th, td {{
+            text-align: left;
+            padding: 10px 12px;
+            border-bottom: 1px solid var(--border-color);
+        }}
+        th {{
+            background-color: #1f242c;
+            color: #ffffff;
+            font-weight: 600;
+        }}
+        tr:nth-child(even) {{
+            background-color: #161b2255;
+        }}
+        .badge {{
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 11px;
+            font-weight: bold;
+            text-transform: uppercase;
+        }}
+        .badge.pass {{ background-color: var(--primary-muted); color: var(--primary); border: 1px solid var(--primary); }}
+        .badge.fail {{ background-color: var(--danger-muted); color: var(--danger); border: 1px solid var(--danger); }}
+        .badge.warning {{ background-color: var(--warning-muted); color: var(--warning); border: 1px solid var(--warning); }}
+        .badge.neutral {{ background-color: #30363d; color: var(--text-color); }}
+        
+        .chart-grid {{
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            margin-top: 30px;
+        }}
+        .chart-card {{
+            background-color: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 15px;
+            text-align: center;
+        }}
+        .chart-card h3 {{
+            margin: 0 0 10px 0;
+            font-size: 15px;
+            color: #ffffff;
+            text-align: left;
+        }}
+        .chart-card img {{
+            max-width: 100%;
+            height: auto;
+            border-radius: 4px;
+            background-color: #000;
+        }}
+        .audit-info {{
+            margin-top: 15px;
+            font-size: 13px;
+            border-left: 3px solid var(--accent);
+            padding-left: 10px;
+            color: #c9d1d9;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div class="header-title">
+                <h1>🔬 Alpha 因子挖掘绩效报告</h1>
+                <p>数据源: {file_text} | 生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+            </div>
+            <div>
+                实验指纹: <span class="fingerprint">{md5_hash}</span>
+            </div>
+        </header>
+
+        <div class="grid-2">
+            <!-- Parameters Card -->
+            <div class="card">
+                <h2>⚙ 1. 因子开发配置 (Parameters)</h2>
+                <table style="margin: 0; font-size: 13px;">
+                    <tr><td>目标收益率 (Target Return)</td><td><b>{target_return_col}</b></td></tr>
+                    <tr><td>仅评估重叠日 (Only Overlap)</td><td>{only_overlap}</td></tr>
+                    <tr><td>极值去极值方法 (Winsorize)</td><td>{winsor_method} [Quantile LB/UB: {quantile_lb}, {quantile_ub}]</td></tr>
+                    <tr><td>自动剔除零成交量行</td><td>{auto_drop_zero_vol}</td></tr>
+                    <tr><td>风险对齐因子 (Neutralization)</td><td>{risk_factors_str}</td></tr>
+                </table>
+                <div class="audit-info">
+                    {data_audit_html}
+                </div>
+            </div>
+
+            <!-- Factor Code Card -->
+            <div class="card">
+                <h2>💻 2. Python 因子表达式 (Factor Code)</h2>
+                <div class="code-block">{safe_expr}</div>
+            </div>
+        </div>
+
+        <!-- KPI Table Card -->
+        <div class="card">
+            <h2>📊 3. 因子评价绩效结果 (Metrics KPI - Period {current_period})</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>量化绩效指标 (Metric)</th>
+                        <th>当前测试值 (Value)</th>
+                        <th>物理意义/表现解读 (Description)</th>
+                        <th>审计状态评级 (Rating)</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {kpi_table_html}
+                </tbody>
+            </table>
+        </div>
+
+        <!-- Visualization Charts -->
+        <div class="chart-grid">
+            <div class="chart-card">
+                <h3>IC Analysis (IC 时序分析图)</h3>
+                <img src="data:image/png;base64,{ic_img}" alt="IC Analysis">
+            </div>
+            <div class="chart-card">
+                <h3>IC Decay (IC 衰退时空图)</h3>
+                <img src="data:image/png;base64,{decay_img}" alt="IC Decay">
+            </div>
+            <div class="chart-card">
+                <h3>Mean Return by Quantile (分位数平均收益)</h3>
+                <img src="data:image/png;base64,{q_img}" alt="Mean Return by Quantile">
+            </div>
+            <div class="chart-card">
+                <h3>Cumulative Returns by Quantile (分位数累计收益)</h3>
+                <img src="data:image/png;base64,{q_cum_img}" alt="Cumulative Returns by Quantile">
+            </div>
+            <div class="chart-card">
+                <h3>Risk Analysis (风险因子相关性热力图)</h3>
+                <img src="data:image/png;base64,{risk_img}" alt="Risk Analysis">
+            </div>
+            <div class="chart-card">
+                <h3>Quantile Turnover (换手率时序)</h3>
+                <img src="data:image/png;base64,{turnover_img}" alt="Quantile Turnover">
+            </div>
+            <div class="chart-card" style="grid-column: span 2;">
+                <h3>Factor Autocorrelation (因子自相关度)</h3>
+                <img src="data:image/png;base64,{autocorr_img}" alt="Factor Autocorrelation">
+            </div>
+        </div>
+    </div>
+</body>
+</html>
+"""
+            with open(save_path, 'w', encoding='utf-8') as f:
+                f.write(html_content)
+
+            QMessageBox.information(
+                self,
+                "Report Exported",
+                f"Successfully exported beautiful alpha factor report to:\n\n{save_path}"
+            )
+        except Exception as e:
+            import traceback
+            QMessageBox.critical(
+                self,
+                "Export Error",
+                f"An error occurred while compiling the report:\n{str(e)}\n\n{traceback.format_exc()}"
+            )
+        finally:
+            QApplication.restoreOverrideCursor()

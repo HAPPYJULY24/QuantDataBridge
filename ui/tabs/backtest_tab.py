@@ -15,6 +15,10 @@ import json
 import uuid
 from pathlib import Path
 from datetime import datetime, timezone
+import io
+import base64
+import hashlib
+import html
 
 # Set backend
 matplotlib.use('QtAgg')
@@ -325,10 +329,12 @@ class BacktestTab(QWidget):
         
         header_layout.addStretch()
         
-        # self.export_btn = QPushButton("💾 Export Backtest Info")
-        # self.export_btn.setEnabled(False) # Enabled after run
-        # self.export_btn.clicked.connect(self._export_trade_log)
-        # header_layout.addWidget(self.export_btn)
+        self.report_btn = QPushButton("📋 Generate Backtest Report")
+        self.report_btn.setEnabled(False)
+        self.report_btn.setStyleSheet(
+            "background:#2E7D32; color:#B0BEC5; padding:4px 10px; border-radius:4px; font-weight:bold;")
+        self.report_btn.clicked.connect(self._export_complete_report)
+        header_layout.addWidget(self.report_btn)
         
         right_layout.addLayout(header_layout)
         
@@ -493,6 +499,9 @@ class BacktestTab(QWidget):
         self.run_btn.setEnabled(False)
         self.run_btn.setText("⏳ Running...")
         self.audit_label.setText("")
+        self.report_btn.setEnabled(False)
+        self.report_btn.setStyleSheet(
+            "background:#2E7D32; color:#B0BEC5; padding:4px 10px; border-radius:4px; font-weight:bold;")
 
         self.worker = BacktestWorker(path, params, task_type='run')
         self.worker.finished.connect(self._on_finished)
@@ -534,7 +543,9 @@ class BacktestTab(QWidget):
             
         self.audit_label.setText("✅ Backtest Finished")
         self.current_results = results
-        # self.export_btn.setEnabled(True)
+        self.report_btn.setEnabled(True)
+        self.report_btn.setStyleSheet(
+            "background:#2E7D32; color:white; padding:4px 10px; border-radius:4px; font-weight:bold;")
         
         self._update_metrics(results['metrics'])
         self._update_charts(results)
@@ -679,6 +690,9 @@ class BacktestTab(QWidget):
         self.run_btn.setText("🚀 Run Backtest")
         self.pressure_btn.setEnabled(True)
         self.pressure_btn.setText("🔥 Pressure Test")
+        self.report_btn.setEnabled(False)
+        self.report_btn.setStyleSheet(
+            "background:#2E7D32; color:#B0BEC5; padding:4px 10px; border-radius:4px; font-weight:bold;")
         
         if "must contain 'close'" in msg:
             QMessageBox.critical(self, "Data Error", 
@@ -912,3 +926,443 @@ class BacktestTab(QWidget):
     def _update_charts(self, results):
         """Update all charts using BacktestCharts widget."""
         self.charts.update_all_charts(results)
+
+    def _export_complete_report(self):
+        if not self.current_results:
+            QMessageBox.warning(self, "No Data", "Please run the backtest first.")
+            return
+
+        from PyQt6.QtWidgets import QFileDialog, QApplication
+        from PyQt6.QtGui import QCursor
+        from datetime import datetime
+        import html
+        import re
+        import hashlib
+        import io
+        import base64
+
+        p = self._last_run_params
+        if not p:
+            QMessageBox.warning(self, "No Data", "No backtest parameters found.")
+            return
+
+        # 1. Gather inputs and metadata
+        universe = Path(self._last_signal_path).stem
+        if universe.endswith("_data"):
+            universe = universe[:-5]
+        strategy_type = p.get('strategy', 'unknown')
+        
+        # 2. Generate MD5 Fingerprint
+        param_str = "_".join(f"{k}={v}" for k, v in sorted(p.items()) if isinstance(v, (int, float, str, bool)))
+        param_str += f"&logic={p.get('signal_logic_code', '')}"
+        md5_hash = hashlib.md5(param_str.encode('utf-8')).hexdigest()[:8].upper()
+        
+        # 3. Resolve default filename
+        clean_universe = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in universe).strip("_")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_filename = f"BacktestReport_{clean_universe}_{strategy_type.replace(' ', '_')}_{md5_hash}_{timestamp}.html"
+        
+        save_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Backtest Report",
+            default_filename,
+            "HTML Files (*.html)"
+        )
+        if not save_path:
+            return
+
+        # Disable cursor during export rendering
+        QApplication.setOverrideCursor(QCursor(Qt.CursorShape.WaitCursor))
+        
+        try:
+            # 4. Convert plots to Base64
+            def get_base64_img(fig):
+                buf = io.BytesIO()
+                fig.savefig(buf, format='png', bbox_inches='tight', dpi=100, facecolor=fig.get_facecolor())
+                buf.seek(0)
+                img_data = base64.b64encode(buf.read()).decode('utf-8')
+                buf.close()
+                return img_data
+
+            equity_img = get_base64_img(self.charts.equity_fig)
+            dist_img = get_base64_img(self.charts.dist_fig)
+            dd_img = get_base64_img(self.charts.dd_fig)
+            risk_img = get_base64_img(self.charts.risk_fig)
+
+            # 5. Extract main performance metrics
+            metrics = self.current_results.get('metrics', {})
+            kpi_table_html = ""
+            for k, v in metrics.items():
+                if k == "Margin Status":
+                    continue
+                val_str = f"{v:,.2f}" if isinstance(v, (int, float)) else str(v)
+                kpi_table_html += f"<tr><td><b>{k}</b></td><td>{val_str}</td></tr>"
+
+            # 6. Check look-ahead audit warning
+            audit = self.current_results.get('audit', {})
+            audit_warning = audit.get('warning', False)
+            audit_diff_pct = audit.get('diff_pct', 0.0)
+            audit_base_profit = audit.get('base_profit', 0.0)
+            audit_audit_profit = audit.get('audit_profit', 0.0)
+
+            if audit_warning:
+                audit_html = f"""
+                <div class="alert danger">
+                    <h3>🚨 Look-Ahead Bias Detected! (前瞻未来函数警告)</h3>
+                    <p>
+                        <b>Original Profit (Close execution):</b> RM {audit_base_profit:,.2f}<br>
+                        <b>Audited Profit (Next Open execution):</b> RM {audit_audit_profit:,.2f}<br>
+                        <b>Profit Deviation:</b> <span class="highlight-danger">{audit_diff_pct*100:.2f}%</span>
+                    </p>
+                    <p style="font-size: 12px; margin-top: 5px; color: var(--text-muted);">
+                        Warning: Significant profit degradation when executing on Next Open (T+1) compared to Close (T). This indicates that the signal depends on information not available at the execution time. Check for look-ahead bias!
+                    </p>
+                </div>
+                """
+            else:
+                audit_html = f"""
+                <div class="alert pass">
+                    <h3>✅ Look-Ahead Bias Audit Passed (前瞻安全审计通过)</h3>
+                    <p>
+                        <b>Original Profit (Close execution):</b> RM {audit_base_profit:,.2f}<br>
+                        <b>Audited Profit (Next Open execution):</b> RM {audit_audit_profit:,.2f}<br>
+                        <b>Profit Deviation:</b> {audit_diff_pct*100:.2f}% (Within safe tolerance bounds)
+                    </p>
+                </div>
+                """
+
+            # 7. Check margin status
+            margin_status = metrics.get('Margin Status', 'Safe')
+            if "MARGIN CALL" in margin_status or margin_status != "Safe":
+                margin_html = f"""
+                <div class="alert danger" style="margin-bottom: 20px;">
+                    <h3>🚨 MARGIN CALL TRIGGERED! (追缴保证金/爆仓强平警告)</h3>
+                    <p>账户爆仓强平拦截状态: <b>{margin_status}</b></p>
+                </div>
+                """
+            else:
+                margin_html = f"""
+                <div class="alert pass" style="margin-bottom: 20px;">
+                    <h3>🛡️ Margin Account Status: SAFE (保证金账户安全)</h3>
+                    <p>无追缴维持保证金（Margin Call）或日内强平事件发生。</p>
+                </div>
+                """
+
+            # 8. Check sensitivity pressure test table
+            sens_rows = []
+            if self.sens_table.rowCount() > 0:
+                for r in range(self.sens_table.rowCount()):
+                    slip_pts = self.sens_table.item(r, 0).text() if self.sens_table.item(r, 0) else ""
+                    net_prof = self.sens_table.item(r, 1).text() if self.sens_table.item(r, 1) else ""
+                    mdd_val = self.sens_table.item(r, 2).text() if self.sens_table.item(r, 2) else ""
+                    trades_val = self.sens_table.item(r, 3).text() if self.sens_table.item(r, 3) else ""
+                    sens_rows.append({
+                        "slippage": slip_pts,
+                        "profit": net_prof,
+                        "mdd": mdd_val,
+                        "trades": trades_val
+                    })
+
+            if sens_rows:
+                sens_table_rows = ""
+                for sr in sens_rows:
+                    sens_table_rows += f"""
+                    <tr>
+                        <td>{sr['slippage']} Ticks</td>
+                        <td><b>RM {sr['profit']}</b></td>
+                        <td>{sr['mdd']}</td>
+                        <td>{sr['trades']}</td>
+                    </tr>
+                    """
+                sens_html = f"""
+                <div class="card" style="margin-top: 20px;">
+                    <h2>🔥 滑点敏感性压力测试 (Slippage Sensitivity Test)</h2>
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>滑点摩擦 (Slippage)</th>
+                                <th>回测净利润 (Net Profit)</th>
+                                <th>最大盯市回撤 (Max Drawdown)</th>
+                                <th>交易笔数 (Trades)</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {sens_table_rows}
+                        </tbody>
+                    </table>
+                </div>
+                """
+            else:
+                sens_html = """
+                <div class="card" style="margin-top: 20px; text-align: center; color: var(--text-muted);">
+                    <h2>🔥 滑点敏感性压力测试 (Slippage Sensitivity Test)</h2>
+                    <p style="padding: 20px 0;">未运行滑点压力测试。可以在界面左下方点击 “🔥 Pressure Test” 按钮来进行多维度摩擦成本测试。</p>
+                </div>
+                """
+
+            # 9. Strategy parameters table
+            bounds_html = ""
+            if strategy_type != "Direct Signal":
+                bounds_html = f"""
+                <tr><td>入场上轨 (Upper Bound >)</td><td>{p.get('upper_bound', 0.0)}</td></tr>
+                <tr><td>入场下轨 (Lower Bound <)</td><td>{p.get('lower_bound', 0.0)}</td></tr>
+                """
+
+            code_html = ""
+            if strategy_type == "Direct Signal" and p.get('signal_logic_code'):
+                safe_code = html.escape(p.get('signal_logic_code', ''))
+                code_html = f"""
+                <div class="card" style="margin-top: 20px;">
+                    <h2>💻 自定义信号生成逻辑 (Signal Logic Code)</h2>
+                    <div class="code-block">{safe_code}</div>
+                </div>
+                """
+
+            # 10. Construct HTML Report Content
+            html_content = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Strategy Backtest Report - {clean_universe}</title>
+    <style>
+        :root {{
+            --bg-color: #0d1117;
+            --card-bg: #161b22;
+            --border-color: #30363d;
+            --text-color: #c9d1d9;
+            --text-muted: #8b949e;
+            --primary: #4CAF50;
+            --primary-muted: rgba(76, 175, 80, 0.15);
+            --accent: #2196F3;
+            --accent-muted: rgba(33, 150, 243, 0.15);
+            --warning: #ff9800;
+            --warning-muted: rgba(255, 152, 0, 0.15);
+            --danger: #f44336;
+            --danger-muted: rgba(244, 67, 54, 0.15);
+        }}
+        body {{
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            margin: 0;
+            padding: 40px 20px;
+            line-height: 1.6;
+        }}
+        .container {{
+            max-width: 1200px;
+            margin: 0 auto;
+        }}
+        header {{
+            border-bottom: 2px solid var(--border-color);
+            padding-bottom: 20px;
+            margin-bottom: 30px;
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-end;
+        }}
+        .header-title h1 {{
+            margin: 0;
+            font-size: 28px;
+            color: #ffffff;
+            font-weight: 700;
+            letter-spacing: -0.5px;
+        }}
+        .header-title p {{
+            margin: 5px 0 0 0;
+            color: var(--text-muted);
+            font-size: 14px;
+        }}
+        .fingerprint {{
+            font-family: monospace;
+            background-color: #1f242c;
+            padding: 4px 8px;
+            border-radius: 4px;
+            border: 1px solid var(--border-color);
+            color: var(--accent);
+        }}
+        .grid-2 {{
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            margin-bottom: 30px;
+        }}
+        .card {{
+            background-color: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 20px;
+            position: relative;
+        }}
+        .card h2 {{
+            margin: 0 0 15px 0;
+            font-size: 18px;
+            font-weight: 600;
+            color: #ffffff;
+        }}
+        .code-block {{
+            background-color: #090c10;
+            border: 1px solid var(--border-color);
+            padding: 15px;
+            border-radius: 6px;
+            font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, Courier, monospace;
+            font-size: 13px;
+            color: #ff7b72;
+            word-break: break-all;
+            white-space: pre-wrap;
+            margin: 10px 0;
+        }}
+        table {{
+            width: 100%;
+            border-collapse: collapse;
+            margin: 15px 0;
+            font-size: 13px;
+        }}
+        th, td {{
+            text-align: left;
+            padding: 10px 12px;
+            border-bottom: 1px solid var(--border-color);
+        }}
+        th {{
+            background-color: #1f242c;
+            color: #ffffff;
+            font-weight: 600;
+        }}
+        tr:nth-child(even) {{
+            background-color: #161b2255;
+        }}
+        .alert {{
+            padding: 15px;
+            border-radius: 6px;
+            margin-bottom: 15px;
+        }}
+        .alert.pass {{ background-color: var(--primary-muted); color: var(--primary); border: 1px solid var(--primary); }}
+        .alert.danger {{ background-color: var(--danger-muted); color: var(--danger); border: 1px solid var(--danger); }}
+        .alert h3 {{ margin: 0 0 8px 0; font-size: 15px; }}
+        .alert p {{ margin: 0; font-size: 13px; }}
+        .highlight-danger {{ color: var(--danger); font-weight: bold; }}
+
+        .chart-grid {{
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            margin-top: 30px;
+        }}
+        .chart-card {{
+            background-color: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 15px;
+            text-align: center;
+        }}
+        .chart-card h3 {{
+            margin: 0 0 10px 0;
+            font-size: 15px;
+            color: #ffffff;
+            text-align: left;
+        }}
+        .chart-card img {{
+            max-width: 100%;
+            height: auto;
+            border-radius: 4px;
+            background-color: #000;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div class="header-title">
+                <h1>🚀 Strategy Backtest Performance Report</h1>
+                <p>策略源: {universe} | 回测时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+            </div>
+            <div>
+                实验指纹: <span class="fingerprint">{md5_hash}</span>
+            </div>
+        </header>
+
+        {margin_html}
+        {audit_html}
+
+        <div class="grid-2">
+            <!-- Parameters Card -->
+            <div class="card">
+                <h2>⚙ 1. 交易规则与摩擦参数 (Params & Friction)</h2>
+                <table>
+                    <thead>
+                        <tr><th>回测配置参数</th><th>设定数值</th></tr>
+                    </thead>
+                    <tbody>
+                        <tr><td>初始资金 (Initial Capital)</td><td>RM {p.get('initial_capital', 0.0):,.2f}</td></tr>
+                        <tr><td>策略类型 (Strategy Type)</td><td><b>{strategy_type}</b></td></tr>
+                        {bounds_html}
+                        <tr><td>波动率仓位管理 (Risk Target %)</td><td>{p.get('risk_target', 0.0)}% (0 = 固定 1 手)</td></tr>
+                        <tr><td>允许持仓手数上限 (Max Lots)</td><td>{p.get('max_lots', 20)}</td></tr>
+                        <tr><td>ADX 趋势过滤器</td><td>{p.get('use_adx_filter', False)}</td></tr>
+                        <tr><td>条内止损阈值 (Intra-bar SL)</td><td>{p.get('sl_pct', 0.0)}%</td></tr>
+                        <tr><td>执行委托时点 (Exec Mode)</td><td><b>{p.get('execution_mode', 'Close')}</b></td></tr>
+                        <tr><td>允许隔夜持仓 / 允许午盘持仓</td><td>{p.get('allow_overnight', True)} / {p.get('allow_lunch', True)}</td></tr>
+                        <tr><td>合约乘数价值 (Multiplier)</td><td>RM {p.get('multiplier', 0.0):,.2f}</td></tr>
+                        <tr><td>单手单边佣金 (Commission)</td><td>RM {p.get('commission', 0.0):,.2f}</td></tr>
+                        <tr><td>成交滑点点数 (Slippage)</td><td>{p.get('slippage', 0.0)} Pts</td></tr>
+                        <tr><td>单手初始保证金 (Init Margin)</td><td>RM {p.get('initial_margin', 0.0):,.2f}</td></tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <!-- Performance Stats Card -->
+            <div class="card">
+                <h2>📈 2. 回测绩效总览 (Performance KPI)</h2>
+                <table>
+                    <thead>
+                        <tr><th>评估绩效指标</th><th>测试表现值</th></tr>
+                    </thead>
+                    <tbody>
+                        {kpi_table_html}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        {code_html}
+        {sens_html}
+
+        <!-- Visualizations -->
+        <div class="chart-grid">
+            <div class="chart-card">
+                <h3>Equity Curve (盯着市值权益曲线)</h3>
+                <img src="data:image/png;base64,{equity_img}" alt="Equity Curve">
+            </div>
+            <div class="chart-card">
+                <h3>Net PnL Distribution (净损益交易直方图)</h3>
+                <img src="data:image/png;base64,{dist_img}" alt="Net PnL Distribution">
+            </div>
+            <div class="chart-card">
+                <h3>Drawdown (盯市最大回撤曲线)</h3>
+                <img src="data:image/png;base64,{dd_img}" alt="Drawdown">
+            </div>
+            <div class="chart-card">
+                <h3>Risk Indicators (ADX / ATR 市场环境指标)</h3>
+                <img src="data:image/png;base64,{risk_img}" alt="Risk Indicators">
+            </div>
+        </div>
+    </div>
+</body>
+</html>
+"""
+            with open(save_path, 'w', encoding='utf-8') as f:
+                f.write(html_content)
+
+            QMessageBox.information(
+                self,
+                "Report Exported",
+                f"Successfully exported beautiful backtest report to:\n\n{save_path}"
+            )
+        except Exception as e:
+            import traceback
+            QMessageBox.critical(
+                self,
+                "Export Error",
+                f"An error occurred while compiling the report:\n{str(e)}\n\n{traceback.format_exc()}"
+            )
+        finally:
+            QApplication.restoreOverrideCursor()
