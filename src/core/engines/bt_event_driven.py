@@ -701,6 +701,22 @@ class EventDrivenBacktest:
         if 'datetime' in df.columns:
             df['datetime'] = pd.to_datetime(df['datetime'])
             df = df.set_index('datetime')
+        else:
+            # Try to convert df.index if it is not numeric
+            if not isinstance(df.index, pd.DatetimeIndex) and not pd.api.types.is_numeric_dtype(df.index.dtype):
+                try:
+                    converted = pd.to_datetime(df.index)
+                    if pd.api.types.is_datetime64_any_dtype(converted) and not converted.isna().all():
+                        df.index = converted
+                except Exception:
+                    pass
+
+        if not isinstance(df.index, pd.DatetimeIndex):
+            raise ValueError(
+                "信号文件不包含有效的日期时间列或时间索引 (Missing 'datetime' column or DatetimeIndex).\n\n"
+                "由于该信号是在代码修复前生成的，缺少必要的时间戳数据。\n"
+                "请切换回 'Alpha Lab (Ultimate)' (因子挖掘选项卡)，重新点击 '运行分析' 并 '保存信号'，然后再进行回测。"
+            )
         
         return df
 

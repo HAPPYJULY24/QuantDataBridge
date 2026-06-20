@@ -208,12 +208,10 @@ class AlphaEngine:
         for p in periods:
             col_name = f'ret_{p}'
             if 'symbol' in df.columns:
-                def calc_lag_return(g):
-                    if open_col:
-                        return g[price_col].shift(-p) / g[open_col].shift(-1) - 1.0
-                    else:
-                        return g[price_col].shift(-p) / g[price_col] - 1.0
-                df[col_name] = df.groupby('symbol', group_keys=False).apply(calc_lag_return)
+                if open_col:
+                    df[col_name] = df.groupby('symbol')[price_col].shift(-p) / df.groupby('symbol')[open_col].shift(-1) - 1.0
+                else:
+                    df[col_name] = df.groupby('symbol')[price_col].shift(-p) / df[price_col] - 1.0
             else:
                 if open_col:
                     df[col_name] = df[price_col].shift(-p) / df[open_col].shift(-1) - 1.0
@@ -1181,7 +1179,8 @@ class AlphaEngine:
         
         # 1. 单资产模式下，强制在文件名中注入 symbol、expr_hash 与 timestamp 进行磁盘隔离
         if 'symbol' in df.columns and df['symbol'].nunique() == 1:
-            sym = str(df['symbol'].iloc[0]).replace('/', '_').replace('\\', '_')
+            import re
+            sym = re.sub(r'[<>:"/\\|?*]', '_', str(df['symbol'].iloc[0]))
             if sym != 'SINGLE_ASSET' and sym not in filepath.name:
                 stem = filepath.stem
                 suffix = filepath.suffix

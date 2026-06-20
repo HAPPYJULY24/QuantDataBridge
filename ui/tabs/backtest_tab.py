@@ -466,7 +466,16 @@ class BacktestTab(QWidget):
         from src.core.models.strategy_config import StrategyConfig
         
         # 1. 自动读取与装载 (Load)
-        json_path = path.replace('_data.parquet', '_config.json')
+        import re
+        stem = Path(path).stem
+        match = re.search(r'^(.*)_data(?:_.*_v\d{8})?$', stem)
+        if match:
+            safe_stg_id = match.group(1)
+            json_path = str(Path(path).parent / f"{safe_stg_id}_config.json")
+        else:
+            json_path = path.replace('_data.parquet', '_config.json')
+            if json_path == path or not os.path.exists(json_path):
+                json_path = path.replace('.parquet', '.json')
             
         configurator = None
         if os.path.exists(json_path):

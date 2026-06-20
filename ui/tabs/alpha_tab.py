@@ -117,6 +117,15 @@ class AlphaWorker(QThread):
             
             # CRITICAL FIX: Ensure 'datetime' is available as a column for the engine
             if 'datetime' not in df.columns:
+                # Try converting index to DatetimeIndex if it is object type
+                if not isinstance(df.index, pd.DatetimeIndex) and not pd.api.types.is_numeric_dtype(df.index.dtype):
+                    try:
+                        converted_index = pd.to_datetime(df.index)
+                        if pd.api.types.is_datetime64_any_dtype(converted_index) and not converted_index.isna().all():
+                            df.index = converted_index
+                    except Exception:
+                        pass
+                
                 # Check if index is datetime
                 if isinstance(df.index, pd.DatetimeIndex):
                     self.log.emit("Resetting DatetimeIndex to 'datetime' column...")
@@ -1230,7 +1239,13 @@ class AlphaTab(QWidget):
                 if not isinstance(d, dict):
                     return cleaned
                 for k, v in d.items():
-                    if pd.isna(v) or v is None:
+                    if v is None:
+                        cleaned[k] = None
+                    elif isinstance(v, (list, tuple, np.ndarray, pd.Series, pd.DataFrame)):
+                        if hasattr(v, 'tolist'):
+                            v = v.tolist()
+                        cleaned[k] = [x.item() if hasattr(x, 'item') else x for x in v]
+                    elif pd.isna(v):
                         cleaned[k] = None
                     elif isinstance(v, (np.integer, int)):
                         cleaned[k] = int(v)
@@ -1241,8 +1256,6 @@ class AlphaTab(QWidget):
                             cleaned[k] = float(v)
                     elif isinstance(v, str):
                         cleaned[k] = v
-                    elif isinstance(v, (list, tuple)):
-                        cleaned[k] = [x.item() if hasattr(x, 'item') else x for x in v]
                     elif hasattr(v, 'item'):  # Handle scalar numpy types
                         val = v.item()
                         if pd.isna(val):
