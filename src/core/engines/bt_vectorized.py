@@ -121,11 +121,15 @@ class VectorizedBacktest:
         # 6. Execution & PnL Logic
         df = self._calculate_pnl(df, execution_mode, multiplier, sl_pct, commission, slippage, tick_size, allow_lunch, allow_overnight)
         
+        # Calculate total trades before position truncation by liquidation
+        entry_mask = (df['pos'] != 0) & (df['pos'] != df['pos'].shift(1).fillna(0))
+        total_trades = int(entry_mask.sum())
+        
         # 7. Equity Curve & Margin (internal only — not exposed in return dict)
         df = self._calculate_equity_and_margin(df, initial_capital, initial_margin, maintenance_margin_rate, tick_size, multiplier, slippage, execution_mode)
         
         # 8. Calculate aggregate metrics (NO trade-level data)
-        metrics = self._calculate_metrics(df, initial_capital)
+        metrics = self._calculate_metrics(df, initial_capital, total_trades=total_trades)
         
         # Return aggregate-only result dict — no 'trades', no 'equity_curve'
         return {
@@ -370,6 +374,9 @@ class VectorizedBacktest:
         df['cost'] = df['pos_change'] * cost_per_lot
         df['net_pnl'] = df['gross_pnl'] - df['cost']
         
+        df['gross_pnl'] = df['gross_pnl'].fillna(0.0)
+        df['net_pnl'] = df['net_pnl'].fillna(0.0)
+        
         return df
     
     def _apply_stop_loss(self, df: pd.DataFrame, sl_pct: float, multiplier: float,
@@ -463,19 +470,16 @@ class VectorizedBacktest:
         sl_exit_long = np.floor((df['sl_prices'] - slippage) / tick_size) * tick_size
         sl_exit_short = np.ceil((df['sl_prices'] + slippage) / tick_size) * tick_size
         
-        if execution_mode == 'Next Open':
-            # Long Exit Gap (Sell) floor discretization
-            sl_gap_long_exit = np.floor((df['open'] - slippage) / tick_size) * tick_size
-            # Short Exit Gap (Buy) ceil discretization
-            sl_gap_short_exit = np.ceil((df['open'] + slippage) / tick_size) * tick_size
-            
-            sl_exit_prices = np.where(
-                df['pos'] > 0,
-                np.where(df['open'] < df['sl_prices'], sl_gap_long_exit, sl_exit_long),
-                np.where(df['open'] > df['sl_prices'], sl_gap_short_exit, sl_exit_short)
-            )
-        else:
-            sl_exit_prices = np.where(df['pos'] > 0, sl_exit_long, sl_exit_short)
+        # Long Exit Gap (Sell) floor discretization
+        sl_gap_long_exit = np.floor((df['open'] - slippage) / tick_size) * tick_size
+        # Short Exit Gap (Buy) ceil discretization
+        sl_gap_short_exit = np.ceil((df['open'] + slippage) / tick_size) * tick_size
+        
+        sl_exit_prices = np.where(
+            df['pos'] > 0,
+            np.where(df['open'] < df['sl_prices'], sl_gap_long_exit, sl_exit_long),
+            np.where(df['open'] > df['sl_prices'], sl_gap_short_exit, sl_exit_short)
+        )
             
         # Calculate standard and stop PnL
         df['normal_pnl'] = (current_price_adjusted - df['ref_price']) * multiplier * df['pos']
@@ -600,7 +604,7 @@ class VectorizedBacktest:
         
         return df
     
-    def _calculate_metrics(self, df: pd.DataFrame, initial_capital: float) -> Dict:
+    def _calculate_metrics(self, df: pd.DataFrame, initial_capital: float, total_trades: Optional[int] = None) -> Dict:
         """
         Calculate aggregate performance metrics for pressure tests.
         Returns only top-level summary metrics: Net Profit, Drawdown, Ratios, Trade Count.
@@ -608,7 +612,9 @@ class VectorizedBacktest:
         """
         total_net_profit = df['net_pnl'].sum()
         final_equity = df['equity'].iloc[-1] if not df.empty else initial_capital
-        total_trades = df[df['pos_change'] > 0].shape[0]
+        if total_trades is None:
+            entry_mask = (df['pos'] != 0) & (df['pos'] != df['pos'].shift(1).fillna(0))
+            total_trades = int(entry_mask.sum())
         
         # Drawdown - directly on raw bar-by-bar df['equity'] (Bug 8)
         df['peak'] = df['equity'].cummax()
@@ -620,16 +626,16 @@ class VectorizedBacktest:
         
         # Sharpe Ratio (daily returns, annualized √252) (Bug 9)
         if isinstance(df.index, pd.DatetimeIndex) and len(df) > 2:
-            daily_equity = df['equity'].resample('D').last()
-            daily_ret = daily_equity.pct_change().fillna(0)
+            daily_equity = df['equity'].resample('D').last().dropna()
+            daily_ret = daily_equity.pct_change().dropna()
             mean_ret = daily_ret.mean()
             std_ret = daily_ret.std()
-            sharpe = (mean_ret / std_ret) * np.sqrt(252) if std_ret != 0 else 0.0
+            sharpe = (mean_ret / std_ret) * np.sqrt(252) if std_ret > 0 else 0.0
         else:
-            daily_ret = df['equity'].pct_change().fillna(0)
+            daily_ret = df['equity'].pct_change().dropna()
             mean_ret = daily_ret.mean()
             std_ret = daily_ret.std()
-            sharpe = (mean_ret / std_ret) * np.sqrt(252) if std_ret != 0 else 0.0
+            sharpe = (mean_ret / std_ret) * np.sqrt(252) if std_ret > 0 else 0.0
         
         # Calmar Ratio
         days = (df.index[-1] - df.index[0]).days if len(df) > 1 else 1

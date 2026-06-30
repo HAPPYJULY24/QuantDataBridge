@@ -139,6 +139,14 @@ class PortfolioRiskManager:
             price: Execution price
             multiplier: Contract multiplier
         """
+        # Resolve initial margin from asset config
+        try:
+            from src.core.models.asset import get_asset_config
+            asset_cfg = get_asset_config(symbol)
+            initial_margin = asset_cfg.initial_margin
+        except Exception:
+            initial_margin = 5000.0  # Safe fallback
+
         if symbol not in self.positions:
             if quantity != 0:
                 self.positions[symbol] = PortfolioPosition(
@@ -146,7 +154,8 @@ class PortfolioRiskManager:
                     asset_type=asset_type,
                     quantity=quantity,
                     avg_price=price,
-                    current_price=price
+                    current_price=price,
+                    margin_used=abs(quantity) * initial_margin
                 )
         else:
             pos = self.positions[symbol]
@@ -169,8 +178,9 @@ class PortfolioRiskManager:
             # C. Scale-out scenario: same direction, size decreases in absolute terms
             # Average entry price remains unchanged.
             
-            # Update quantity and recalculate PnL at the new price
+            # Update quantity, margin_used and recalculate PnL at the new price
             pos.quantity = quantity
+            pos.margin_used = abs(quantity) * initial_margin
             pos.update_price(price, multiplier)
     
     def get_portfolio_summary(self) -> Dict:

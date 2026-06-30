@@ -1229,9 +1229,53 @@ $env:PYTHONPATH="d:\\personal\\quant\\Quant\\-"; pytest tests/test\_backtest\_lo
 1\. 打开回测引擎界面，选择 \`Direct Signal\` 策略。
 
 2\. 在 \`Signal Logic (Python)\` 中输入含有未来函数的代码：
+```powershell
+# 执行回测逻辑与防前瞻偏差单元测试
+$env:PYTHONPATH="d:\personal\quant\Quant\-"; pytest tests/test_backtest_logic.py -v
+```
 
-   \`df\['signal'\] \= np.where(df\['close'\].shift(-1) \> df\['close'\], 1, 0)\`
+### Manual Verification
 
-3\. 点击 \*\*🚀 Run Backtest\*\*，验证系统是否抛出安全拦截弹窗，警告含有未来函数。
+1. 打开回测引擎界面，选择 `Direct Signal` 策略。
 
-4\. 输入合法代码，点击运行，验证是否正常计算并能正常触发 PnL 偏移警告（如有泄露）。
+2. 在 `Signal Logic (Python)` 中输入含有未来函数的代码：
+
+   `df['signal'] = np.where(df['close'].shift(-1) > df['close'], 1, 0)`
+
+3. 点击 **🚀 Run Backtest**，验证系统是否抛出安全拦截弹窗，警告含有未来函数。
+
+4. 输入合法代码，点击运行，验证是否正常计算并能正常触发 PnL 偏移警告（如有泄露）。
+
+---
+
+### **第6轮审查与解决方案** # Backtest Engine Logic Correctness & Security Audit (Round 6)
+
+本轮审查针对回测双引擎计算对齐、交易次数统计、跳空止损结算、AST防前瞻泄露安全和组合风控展开，并提供完整修复细节，与先前修复方案无任何冲突且完全互补。
+
+#### 1. 向量化引擎“总交易次数”双倍计数纠偏 (Defect 1)
+* **发现问题**：原有的交易次数计算利用一阶差分绝对值 `pos_change > 0` 计数，导致开仓、平仓各被计数一次，总数虚高了 100%。
+* **解决方案**：引入纯向量化布尔掩码公式，在 `_calculate_equity_and_margin` 发生强平仓位截断前直接计算：
+  `total_trades = int(((df['pos'] != 0) & (df['pos'] != df['pos'].shift(1).fillna(0))).sum())`
+  这不仅实现了精确计数，同时在首日强平仓位截断为 0 时，通过在 truncation 前计算并传入 `_calculate_metrics` 规避了 trade 计数漏记为 0 的异常。
+
+#### 2. Vectorized 引擎 Close 模式补齐 Overnight 跳空止损 (Defect 2)
+* **发现问题**：此前仅在 `Next Open` 模式下考虑了开盘价越过止损价（Gap）时的强平结算处理，而在 `Close` 模式下直接使用理论 `sl_prices` 结转，导致 Close 模式在跳空行情下存在“偷价避险”的收益虚高问题。
+* **解决方案**：移除 `execution_mode == 'Next Open'` 限制。现在 Close 模式在 Day T+1 开盘时如果直接突破止损价格，也会正确以 open 价格为基准配合滑点与离散化计算实际止损价平仓。
+
+#### 3. Sharpe 比例非交易日对齐与 NaN 传播漏洞治理 (Defect 3)
+* **发现问题**：向量化与事件驱动在 Sharpe 计算上对周末/节假日处理口径不一致。同时，向量化在首行 shift 计算由于缺失 fillna，使得 gross_pnl 与 net_pnl 首行存在 NaN，导致通过 numpy 计算累计 equity 时将整条 equity 曲线全数传播为 NaN，继而引发 dropna 后数据为空导致 pct_change 崩溃。
+* **解决方案**：
+  * 在重采样 `daily_equity` 与收益率 `daily_ret` 时主动使用 `.dropna()` 过滤非交易日，对齐双端引擎。
+  * 在 `_calculate_pnl` 末端统一执行 `df['gross_pnl'] = df['gross_pnl'].fillna(0.0)` 与 `df['net_pnl'] = df['net_pnl'].fillna(0.0)`，彻底消除了 NaN 在 numpy 累加和中的传播，彻底排除了崩溃隐患。
+
+#### 4. 事件驱动引擎单 Bar 最低持仓限制解锁 (Defect 4)
+* **发现问题**：`bt_event_driven.py` 的 Phase III 强行阻断了 `i > entered_this_bar_index` 条件，导致高频 1-Bar 往返平仓/反向交易在事件驱动回测中比向量化延迟 1 个 Bar 执行，引起明显的收益与指标偏差。
+* **解决方案**：删除该条件拦截。允许事件驱动引擎在 Day T 进场后直接根据 Day T 收盘信号在 Day T+1 开盘执行平仓出场，实现双引擎时序的完美一致。
+
+#### 5. AST 静态安全防前瞻二元算术逃逸漏洞修复 (Defect 5)
+* **发现问题**：静态 AST 安全校验器此前仅对 `UnaryOp` (USub) 进行过滤，使得用户利用二元操作（如 `df.shift(1 - 2)` 或 `df.iloc[1 - 2]`）可以轻松绕过静态检查，造成前瞻泄露。
+* **解决方案**：引入递归式的静态二元与一元算术表达式求值器 `evaluate_static_node`，对 AST 参数节点直接求值。如果静态估值结果为负数，抛出 ValueError 进行强行拦截。同时屏蔽了对 `.tail()` 方法的调用。
+
+#### 6. 组合风控 margin_used 实数更新 (Defect 6)
+* **发现问题**：`PortfolioPosition` 的 `margin_used` 属性在更新中恒为默认值 0.0，导致组合整体风险度计算 `Portfolio Risk` 恒显示为 0.0%，多仓位风控阻断拦截机制形同虚设。
+* **解决方案**：引入 `get_asset_config` 获取合约保证金规范，并在仓位新建与更新时用 `abs(quantity) * initial_margin` 实数计算 `margin_used`，保证组合风控看板与多品种保证金校验完全生效。

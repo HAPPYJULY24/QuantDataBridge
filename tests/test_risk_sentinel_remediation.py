@@ -125,7 +125,7 @@ def test_event_driven_gap_liquidation_discretization():
         'factor': [0.0, 0.0, 0.0],
         'atr': [20.0, 20.0, 20.0],
         'adx': [25.0, 25.0, 25.0],
-        'signal': [1, 0, 0] # LONG entry on day 1 -> buy at day 2 open (4050)
+        'signal': [1, 1, 0] # LONG entry on day 1 -> buy at day 2 open (4050)
     }, index=dates)
 
     engine = EventDrivenBacktest()

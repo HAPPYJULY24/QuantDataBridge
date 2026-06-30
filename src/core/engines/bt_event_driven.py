@@ -572,16 +572,14 @@ class EventDrivenBacktest:
                         pending_action = -1
                         self._emit_log(f"💡 [{row.Index}] PHASE III — Signal=-1 → SHORT queued for T+1")
             else:
-                # State: IN POSITION — look for exit signals
-                if i > entered_this_bar_index:
-                    if current_position.direction == TradeDirection.LONG:
-                        if raw_sig == 0 or raw_sig == -1:
-                            pending_action = 2
-                            self._emit_log(f"💡 [{row.Index}] PHASE III — Signal={raw_sig} → CLOSE LONG queued for T+1")
-                    elif current_position.direction == TradeDirection.SHORT:
-                        if raw_sig == 0 or raw_sig == 1:
-                            pending_action = 2
-                            self._emit_log(f"💡 [{row.Index}] PHASE III — Signal={raw_sig} → CLOSE SHORT queued for T+1")
+                if current_position.direction == TradeDirection.LONG:
+                    if raw_sig == 0 or raw_sig == -1:
+                        pending_action = 2
+                        self._emit_log(f"💡 [{row.Index}] PHASE III — Signal={raw_sig} → CLOSE LONG queued for T+1")
+                elif current_position.direction == TradeDirection.SHORT:
+                    if raw_sig == 0 or raw_sig == 1:
+                        pending_action = 2
+                        self._emit_log(f"💡 [{row.Index}] PHASE III — Signal={raw_sig} → CLOSE SHORT queued for T+1")
             
             # Step III-4: Commit bar state to output arrays
             signals_arr[i] = pending_action if pending_action in [1, -1] else 0

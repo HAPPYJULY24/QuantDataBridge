@@ -218,7 +218,7 @@ def test_round_4_slippage_discrete_and_compliant_blotter():
         'adx': [25.0, 25.0, 25.0]
     }, index=dates)
     
-    df['signal'] = [1, 0, 0] # LONG signal on 01-01 -> Buy at 102.3 on 01-02. Exit at EOD close 105.0 on 01-03.
+    df['signal'] = [1, 1, 0] # LONG signal on 01-01 -> Buy at 102.3 on 01-02. Exit at EOD close 105.0 on 01-03.
     
     engine = EventDrivenBacktest()
     cfg = RiskConfig(
@@ -432,11 +432,13 @@ def test_early_sorting_and_numba_grouped_rank_correctness():
     dates_A = pd.date_range("2026-05-01", periods=14)
     dates_B = pd.date_range("2026-05-01", periods=14)
     
-    # Factor is designed to have a specific expanding rank percentile at Day 11 (index 10):
-    # History for A up to Day 11: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 5.0] (11 elements)
-    # The rank of 5.0 is: 4 (less than 5) + 0.5 * (2-1) + 1 = 5.5
-    # The percentile is: 5.5 / 11 = 0.5. Mapped to group: 0.5 is in (0.4, 0.6] -> Group 3
-    # Day 12 is 12.0 -> Rank 12 -> percentile 12/12 = 1.0 -> Group 5
+    # Factor is designed to have a specific expanding rank percentile at Day 11 (index 10) after rolling Z-scoring (window=5):
+    # - Day 10 (index 9, Z-score=1.264911) -> Z-score list: [0, 0, 0, 0, 1.26, 1.26, 1.26, 1.26, 1.26, 1.26] (10 items, mean=0.758, std=0.666).
+    #   Rank of 1.264911 is 7.5. Percentile: 7.5 / 10 = 0.75 -> Group 4
+    # - Day 11 (index 10, factor=5.0, Z-score=-1.455651) -> Z-score list: [0, 0, 0, 0, 1.26, 1.26, 1.26, 1.26, 1.26, 1.26, -1.45].
+    #   Rank of -1.455651 is 1.0 (min). Percentile: 1.0 / 11 = 0.0909 -> Group 1
+    # - Day 12 (index 11, factor=12.0, Z-score=1.236268) -> Z-score list: [0, 0, 0, 0, 1.26, 1.26, 1.26, 1.26, 1.26, 1.26, -1.45, 1.23].
+    #   Rank of 1.236268 is 6.0. Percentile: 6.0 / 12 = 0.50 -> Group 3
     factor_A = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 5.0, 12.0, 13.0, 14.0]
     factor_B = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 100.0, 50.0, 120.0, 130.0, 140.0]
     
@@ -471,14 +473,14 @@ def test_early_sorting_and_numba_grouped_rank_correctness():
     sig_df = result_unsorted['signal_df']
     df_A = sig_df[sig_df['symbol'] == 'A'].sort_values('datetime').reset_index(drop=True)
     
-    # Index 9 (Day 10) -> expanding rank percentile should be 0.75 -> Group 4
-    assert df_A.loc[9, 'quantile_group'] == 4
+    # Index 9 (Day 10) -> Z-scored expanding rank percentile is 0.75 -> Group 4
+    assert df_A.loc[9, 'quantile_group'] == 4.0
     
-    # Index 10 (Day 11, factor=5.0) -> expanding rank percentile should be ~0.09 -> Group 1
-    assert df_A.loc[10, 'quantile_group'] == 1
+    # Index 10 (Day 11, factor=5.0) -> Z-scored expanding rank percentile is ~0.09 -> Group 1
+    assert df_A.loc[10, 'quantile_group'] == 1.0
     
-    # Index 11 (Day 12, factor=12.0) -> expanding rank percentile should be ~0.50 -> Group 3
-    assert df_A.loc[11, 'quantile_group'] == 3
+    # Index 11 (Day 12, factor=12.0) -> Z-scored expanding rank percentile is 0.50 -> Group 3
+    assert df_A.loc[11, 'quantile_group'] == 3.0
 
 
 def test_narrow_panel_fallback_and_no_collapse():
