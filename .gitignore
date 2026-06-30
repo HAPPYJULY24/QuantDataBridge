@@ -45,8 +45,12 @@ exported_data/*.xlsx
 data/
 data/store/*.parquet
 
+# 🆕 Datacenter (运行时生成的数据，不提交到仓库)
+datacenter/
+
 # 🆕 用户配置(不提交)
-config/
+config/*
+!config/languages/
 config_private.py
 
 # PyInstaller

@@ -1,0 +1,131 @@
+{
+  "alignment": {
+    "already_aligned_title": "已对齐文件检测",
+    "anchor_label": "选择基准资产 (Anchor):",
+    "anchor_tooltip": "作为对齐基准的资产。其他资产的数据将前向填充至此基准交易时间上。",
+    "asset_a": "Asset A (基准):",
+    "asset_b": "Asset B (参考):",
+    "buttons": {
+      "execute": "🚀 执行对齐",
+      "executing": "⏳ 正在对齐...",
+      "export": "📤 导出结果",
+      "refresh": "⟳ 刷新列表"
+    },
+    "forward_fill": "对参考资产执行前向填充 (ffill)",
+    "messages": {
+      "error_title": "对齐错误",
+      "export_error_title": "导出错误",
+      "export_success_title": "导出成功",
+      "save_dialog_title": "导出对齐后数据",
+      "scan_error_message": "扫描目录失败：\n{error}",
+      "scan_error_title": "扫描错误",
+      "select_different_files": "不同槽位中不能选择完全相同的数据文件！",
+      "select_error_title": "文件选择错误",
+      "success_title": "对齐成功"
+    },
+    "multi_align_checkbox": "开启多数据流对齐 (A+B+C/D/E)",
+    "optional_placeholder": "(可选 - 不使用)",
+    "options": "对齐配置项",
+    "placeholders": {
+      "no_files": "数据中心未找到 Parquet 文件"
+    },
+    "preview": {
+      "title": "对齐预览数据 (前50行)"
+    },
+    "select_ab_required": "必须选择 Asset A 和 Asset B 文件！",
+    "status": {
+      "aligning": "⏳ 正在执行时间对齐...",
+      "files_scanned": "扫描完成，找到 {count} 个 parquet 文件。",
+      "no_files": "数据中心为空！请先去数据获取页面获取数据。",
+      "ready": "就绪。请选择数据文件并点击“执行对齐”。"
+    },
+    "title": "数据对齐工作室"
+  },
+  "common": {
+    "error": "错误",
+    "success": "成功"
+  },
+  "mainwindow": {
+    "data_manager_btn": "📂 数据管理",
+    "disk_warning_message": "磁盘剩余空间不足 ({msg})。\n\n建议清理历史缓存以释放空间。\n\n是否打开数据管理中心？",
+    "disk_warning_title": "磁盘空间警告",
+    "error_message": "发生系统级错误：\n\n{error}",
+    "error_title": "系统错误",
+    "main_title": "Quant Data Bridge",
+    "title": "Quant Data Bridge"
+  },
+  "menu": {
+    "data_alignment": "🔬 数据对齐工作台",
+    "language_settings": "🌐 语言设置",
+    "settings": "⚙️ 设置",
+    "tools": "🔧 工具",
+    "tv_config": "🔐 TradingView 配置"
+  },
+  "messages": {
+    "error_title": "错误",
+    "insufficient_date_range": "粒度为 '{tf}' 的数据获取，日期范围至少需要包含 {min_days} 天。",
+    "intraday_limit_60d_v2": "分时线数据（如 5m, 15m, 1h）受 API 限制，仅支持获取最近 60 天内的数据。\n当前所选日期已超出此限制。",
+    "minute_limit_7d_v2": "1分钟线数据受 API 限制，仅支持获取最近 7 天内的数据。\n当前所选日期已超出此限制。",
+    "no_data_found_details": "未找到 {symbol} 对应的数据。"
+  },
+  "settings": {
+    "cancel": "取消",
+    "language": "语言首选项",
+    "language_label": "语言 (Language):",
+    "restart_message": "语言设置已保存，是否立即重启应用以使设置生效？",
+    "restart_required": "语言设置更改后需要重启应用才能生效。",
+    "restart_title": "重启提示",
+    "save": "保存",
+    "title": "应用设置"
+  },
+  "status": {
+    "files_found": "找到 {count} 个文件。"
+  },
+  "tabs": {
+    "alpha_research": "🧪 因子挖掘",
+    "backtest_engine": "📈 回测引擎",
+    "data_fetcher": "📡 数据获取",
+    "risk_control": "🛡️ 风控哨兵"
+  },
+  "tips": {
+    "session_filter_custom": "过滤自定义交易时段数据（例如跨日交易时段 20:00 至次日 04:00）",
+    "session_filter_my": "自动过滤马来西亚交易所交易时段（上午 9:00-12:30，下午 14:30-18:00），剔除非交易时间数据"
+  },
+  "tv_settings": {
+    "cancel_btn": "取消",
+    "clear_btn": "清空凭证",
+    "clear_confirm_message": "您确定要清空已保存的 TradingView 登录凭证吗？",
+    "clear_confirm_title": "确认清空",
+    "clear_error": "清空 TradingView 凭证失败。",
+    "clear_success": "已保存的 TradingView 登录凭证清空成功。",
+    "enable_checkbox": "启用 TradingView 连接",
+    "group_title": "登录凭证",
+    "header": "TradingView 账户 Session 配置",
+    "info": "配置您的 TradingView 账号密码，以便通过 TV 数据源获取马交所期货历史数据。",
+    "input_error_message": "请输入完整的 TV 用户名和密码。",
+    "input_error_title": "输入错误",
+    "password_label": "密码:",
+    "password_placeholder": "输入 TV 密码",
+    "save_btn": "保存配置",
+    "save_error_message": "保存 TradingView 配置失败。",
+    "save_error_title": "保存错误",
+    "save_success_message": "TradingView 配置保存成功！",
+    "save_success_title": "保存成功",
+    "security_note": "安全提示: 您的凭证将加密保存在本地：{path}。",
+    "test_btn": "测试连接",
+    "test_message": "用户 {username} 连接测试成功！",
+    "test_title": "连接测试",
+    "title": "TradingView 配置",
+    "username_label": "用户名:",
+    "username_placeholder": "输入 TV 用户名或邮箱",
+    "validation_error_message": "TradingView 账户密码验证失败，请重新检查输入。",
+    "validation_error_title": "验证错误"
+  },
+  "ui": {
+    "apply_session_filter": "启用交易时段过滤",
+    "custom_session": "自定义过滤时段:"
+  },
+  "window": {
+    "title": "Quant Data Bridge"
+  }
+}

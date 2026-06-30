@@ -1,0 +1,131 @@
+{
+  "alignment": {
+    "already_aligned_title": "Alignment Check",
+    "anchor_label": "Select Anchor Asset:",
+    "anchor_tooltip": "The base asset to align all other assets with. Other assets will be forward filled.",
+    "asset_a": "Asset A (Anchor):",
+    "asset_b": "Asset B (Ref):",
+    "buttons": {
+      "execute": "🚀 Run Alignment",
+      "executing": "⏳ Aligning...",
+      "export": "📤 Export Result",
+      "refresh": "⟳ Refresh List"
+    },
+    "forward_fill": "Apply Forward Fill (ffill) on reference assets",
+    "messages": {
+      "error_title": "Alignment Error",
+      "export_error_title": "Export Error",
+      "export_success_title": "Export Success",
+      "save_dialog_title": "Export Aligned Data",
+      "scan_error_message": "Failed to scan directory:\n{error}",
+      "scan_error_title": "Scan Error",
+      "select_different_files": "Please select different files for each slot.",
+      "select_error_title": "Selection Error",
+      "success_title": "Alignment Complete"
+    },
+    "multi_align_checkbox": "Enable Multi-Data Alignment (A+B+C/D/E)",
+    "optional_placeholder": "(Optional - Not Used)",
+    "options": "Alignment Options",
+    "placeholders": {
+      "no_files": "No files found in datacenter"
+    },
+    "preview": {
+      "title": "Data Preview (First 50 Rows)"
+    },
+    "select_ab_required": "Asset A and Asset B are required!",
+    "status": {
+      "aligning": "⏳ Performing time alignment...",
+      "files_scanned": "Scanned {count} parquet files.",
+      "no_files": "Data Center is empty. Please fetch data first.",
+      "ready": "Ready. Please select files and click 'Run Alignment'."
+    },
+    "title": "Data Alignment Studio"
+  },
+  "common": {
+    "error": "Error",
+    "success": "Success"
+  },
+  "mainwindow": {
+    "data_manager_btn": "📂 Data Manager",
+    "disk_warning_message": "Disk space is low ({msg}).\n\nIt is recommended to clear old cache files.\n\nOpen Data Manager?",
+    "disk_warning_title": "Disk Space Warning",
+    "error_message": "An error occurred:\n\n{error}",
+    "error_title": "System Error",
+    "main_title": "Quant Data Bridge",
+    "title": "Quant Data Bridge"
+  },
+  "menu": {
+    "data_alignment": "🔬 Data Alignment Studio",
+    "language_settings": "🌐 Language Settings",
+    "settings": "⚙️ Settings",
+    "tools": "🔧 Tools",
+    "tv_config": "🔐 TradingView Config"
+  },
+  "messages": {
+    "error_title": "Error",
+    "insufficient_date_range": "Timeframe '{tf}' requires at least {min_days} days range.",
+    "intraday_limit_60d_v2": "Intraday data ({timeframe}) is only available for the LAST 60 days from today.\nYour Start Date is {days_diff} days ago.",
+    "minute_limit_7d_v2": "1-minute data is only available for the LAST 7 days from today.\nYour Start Date is {days_diff} days ago.",
+    "no_data_found_details": "No data found for {symbol}."
+  },
+  "settings": {
+    "cancel": "Cancel",
+    "language": "Language Preference",
+    "language_label": "Language (Language):",
+    "restart_message": "Settings saved. Do you want to restart the application now to apply the new language?",
+    "restart_required": "Language changes will take effect after restarting the application.",
+    "restart_title": "Restart Required",
+    "save": "Save",
+    "title": "Application Settings"
+  },
+  "status": {
+    "files_found": "Found {count} files."
+  },
+  "tabs": {
+    "alpha_research": "🧪 Alpha Research",
+    "backtest_engine": "📈 Backtest Engine",
+    "data_fetcher": "📡 Data Fetcher",
+    "risk_control": "🛡️ Risk Control"
+  },
+  "tips": {
+    "session_filter_custom": "Filters data based on custom session hours (e.g. 20:00 - 04:00 next day)",
+    "session_filter_my": "Automatically filters Bursa Malaysia trading sessions (9:00-12:30, 14:30-18:00)"
+  },
+  "tv_settings": {
+    "cancel_btn": "Cancel",
+    "clear_btn": "Clear Credentials",
+    "clear_confirm_message": "Are you sure you want to clear saved TV credentials?",
+    "clear_confirm_title": "Confirm Clear",
+    "clear_error": "Failed to clear TV credentials.",
+    "clear_success": "Saved TradingView credentials cleared.",
+    "enable_checkbox": "Enable TradingView Connection",
+    "group_title": "TradingView Settings",
+    "header": "TradingView Credentials",
+    "info": "Configure TradingView credentials to download bursa futures data from TradingView adapter.",
+    "input_error_message": "Please fill in both TV username and password.",
+    "input_error_title": "Input Error",
+    "password_label": "Password:",
+    "password_placeholder": "Enter TradingView password",
+    "save_btn": "Save Config",
+    "save_error_message": "Failed to save TradingView configuration.",
+    "save_error_title": "Save Error",
+    "save_success_message": "TradingView configuration saved successfully.",
+    "save_success_title": "Save Success",
+    "security_note": "Security Note: Credentials are saved encrypted locally at {path}.",
+    "test_btn": "Test Connection",
+    "test_message": "TradingView login test succeeded for user: {username}",
+    "test_title": "Connection Test",
+    "title": "TradingView Configuration",
+    "username_label": "Username:",
+    "username_placeholder": "Enter TradingView username or email",
+    "validation_error_message": "TradingView validation failed. Please check your credentials.",
+    "validation_error_title": "Validation Error"
+  },
+  "ui": {
+    "apply_session_filter": "Apply Session Filter",
+    "custom_session": "Custom Session:"
+  },
+  "window": {
+    "title": "Quant Data Bridge"
+  }
+}

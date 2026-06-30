@@ -26,6 +26,7 @@ plt.style.use('dark_background')
 
 from src.quant_bridge import BacktestEngine
 from ui.widgets.backtest_charts import BacktestCharts
+from logic.localization import tr
 
 
 class BacktestWorker(QThread):
@@ -162,10 +163,13 @@ class BacktestTab(QWidget):
         data_layout = QFormLayout()
         
         self.file_combo = QComboBox()
+        self.file_combo.setMaximumWidth(200)
 
         data_layout.addRow("File:", self.file_combo)
         
-        refresh_btn = QPushButton("Refresh List")
+        refresh_btn = QPushButton(tr("alignment.buttons.refresh"))
+        refresh_btn.setMinimumHeight(30)
+        refresh_btn.setStyleSheet("background-color: #37474F; color: white; font-weight: bold; border-radius: 4px; border: 1px solid #555;")
         refresh_btn.clicked.connect(self.refresh_files)
         data_layout.addRow(refresh_btn)
         
