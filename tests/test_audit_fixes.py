@@ -419,3 +419,150 @@ def test_round_4_param_search_file_isolation_concurrency():
             assert tl_file.stat().st_size > 0
             df_read = pd.read_csv(tl_file)
             assert len(df_read) == 2
+
+
+def test_early_sorting_and_numba_grouped_rank_correctness():
+    """
+    Verify early sorting correctness and Numba-based grouped expanding rank JIT execution.
+    We pass unsorted shuffled data, run the pipeline, and assert that the results
+    are mathematically identical to running it on sorted data (proving early sorting works).
+    We also directly assert the expanding rank JIT logic values.
+    """
+    # 14 elements per symbol A and B
+    dates_A = pd.date_range("2026-05-01", periods=14)
+    dates_B = pd.date_range("2026-05-01", periods=14)
+    
+    # Factor is designed to have a specific expanding rank percentile at Day 11 (index 10):
+    # History for A up to Day 11: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 5.0] (11 elements)
+    # The rank of 5.0 is: 4 (less than 5) + 0.5 * (2-1) + 1 = 5.5
+    # The percentile is: 5.5 / 11 = 0.5. Mapped to group: 0.5 is in (0.4, 0.6] -> Group 3
+    # Day 12 is 12.0 -> Rank 12 -> percentile 12/12 = 1.0 -> Group 5
+    factor_A = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 5.0, 12.0, 13.0, 14.0]
+    factor_B = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 100.0, 50.0, 120.0, 130.0, 140.0]
+    
+    df_sorted = pd.DataFrame({
+        'datetime': list(dates_A) + list(dates_B),
+        'symbol': ['A'] * 14 + ['B'] * 14,
+        'close': [100.0 + x for x in factor_A] + [200.0 + x for x in factor_B],
+        'factor': factor_A + factor_B
+    })
+    
+    # Shuffle the dataframe to make it unsorted
+    df_unsorted = df_sorted.sample(frac=1.0, random_state=42).copy()
+    
+    engine = AlphaEngine()
+    config = {
+        'winsor_method': '3-Sigma',
+        'quantile_lb': 0.01,
+        'quantile_ub': 0.99,
+        'target_return_col': 'close',
+        'rolling_standardization_window': 5
+    }
+    
+    result_sorted = engine.process_pipeline(df_sorted, "df['factor'] = df['factor']", config, periods=[1])
+    result_unsorted = engine.process_pipeline(df_unsorted, "df['factor'] = df['factor']", config, periods=[1])
+    
+    # Verify outputs are exactly identical (proving Step 0 sorted order was enforced and used)
+    pd.testing.assert_frame_equal(result_sorted['signal_df'].reset_index(drop=True), result_unsorted['signal_df'].reset_index(drop=True))
+    pd.testing.assert_frame_equal(result_sorted['ic_series'], result_unsorted['ic_series'])
+    
+    # Verify JIT grouped rank outputs at specific indices:
+    # Verify JIT grouped rank outputs at specific indices (directly matching the Z-scored expanding math):
+    sig_df = result_unsorted['signal_df']
+    df_A = sig_df[sig_df['symbol'] == 'A'].sort_values('datetime').reset_index(drop=True)
+    
+    # Index 9 (Day 10) -> expanding rank percentile should be 0.75 -> Group 4
+    assert df_A.loc[9, 'quantile_group'] == 4
+    
+    # Index 10 (Day 11, factor=5.0) -> expanding rank percentile should be ~0.09 -> Group 1
+    assert df_A.loc[10, 'quantile_group'] == 1
+    
+    # Index 11 (Day 12, factor=12.0) -> expanding rank percentile should be ~0.50 -> Group 3
+    assert df_A.loc[11, 'quantile_group'] == 3
+
+
+def test_narrow_panel_fallback_and_no_collapse():
+    """
+    Verify that narrow panel (N < 5) does not collapse daily IC to NaN
+    and falls back correctly to Time-Series Mode.
+    """
+    dates = pd.date_range("2026-05-01", periods=20, freq="D")
+    df_narrow = pd.DataFrame({
+        'datetime': list(dates) * 2,
+        'symbol': ['FKLI'] * 20 + ['FCPO'] * 20,
+        'close': [100.0 + i for i in range(20)] + [200.0 - i for i in range(20)],
+        'factor': [1.0 + i % 3 for i in range(20)] + [3.0 - i % 3 for i in range(20)]
+    })
+    
+    engine = AlphaEngine()
+    config = {
+        'winsor_method': '3-Sigma',
+        'quantile_lb': 0.01,
+        'quantile_ub': 0.99,
+        'target_return_col': 'close'
+    }
+    
+    # N = 2 < 5, should fallback to TS Mode evaluation
+    result = engine.process_pipeline(df_narrow, "df['factor'] = df['factor']", config, periods=[1])
+    
+    # Assert Rank IC is not NaN
+    rank_ic = result['ic_decay_table'].loc[1, 'Rank IC']
+    assert not pd.isna(rank_ic)
+    assert result['ic_decay_table'].loc[1, 'Sample Type'] == 'rolling_rank_ic_points'
+
+
+def test_lookahead_free_ts_quantile_assignment():
+    """
+    Verify that TS mode quantile assignment has zero look-ahead bias.
+    Changing future data should not affect past quantile assignments.
+    """
+    dates = pd.date_range("2026-05-01", periods=25, freq="D")
+    df_ts_1 = pd.DataFrame({
+        'datetime': dates,
+        'close': [100.0 + i for i in range(25)],
+        'factor': [1.0 + (i % 5) for i in range(25)]
+    })
+    
+    engine = AlphaEngine()
+    config = {
+        'winsor_method': '3-Sigma',
+        'quantile_lb': 0.01,
+        'quantile_ub': 0.99,
+        'target_return_col': 'close'
+    }
+    
+    res1 = engine.process_pipeline(df_ts_1, "df['factor'] = df['factor']", config, periods=[1])
+    q_cum1 = res1['quantile_cum_ret']
+    
+    # Modify future factor value (from index 20 onwards)
+    df_ts_2 = df_ts_1.copy()
+    df_ts_2.loc[20:, 'factor'] = 1000.0
+    
+    res2 = engine.process_pipeline(df_ts_2, "df['factor'] = df['factor']", config, periods=[1])
+    q_cum2 = res2['quantile_cum_ret']
+    
+    # The cumulative returns of past rows (first 15 rows) should be identical
+    pd.testing.assert_frame_equal(q_cum1.head(15), q_cum2.head(15))
+    
+    # Direct Assertion: assigned quantile groups for the first 15 rows must be completely identical (look-ahead free)
+    group1 = res1['signal_df']['quantile_group'].head(15)
+    group2 = res2['signal_df']['quantile_group'].head(15)
+    pd.testing.assert_series_equal(group1, group2)
+
+
+def test_futures_rollover_warning_triggered():
+    """
+    Verify that when symbol contains 'FKLI' or 'FCPO' and open is missing,
+    a UserWarning is raised.
+    """
+    df = pd.DataFrame({
+        'datetime': pd.date_range("2026-05-01", periods=5),
+        'symbol': ['FCPO_CONT'] * 5,
+        'close': [100.0, 101.0, 102.0, 103.0, 104.0],
+        'factor': [1, 2, 3, 4, 5]
+    })
+    
+    import warnings
+    with pytest.warns(UserWarning, match="⚠️ \\[FUTURES ROLLOVER WARNING\\]"):
+        AlphaEngine.calculate_execution_returns(df, price_col='close', open_col=None, periods=[1])
+

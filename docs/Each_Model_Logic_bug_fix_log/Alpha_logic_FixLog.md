@@ -314,9 +314,49 @@ ridge\_layout.addWidget(self.ridge\_alpha)
 
 neut\_layout.addLayout(ridge\_layout)
 
-\# Hide Ridge Alpha controls as OLS does not use regularization
+# Hide Ridge Alpha controls as OLS does not use regularization
 
 self.ridge\_label.setVisible(False)
 
 self.ridge\_alpha.setVisible(False)
 
+
+## **第四轮审查与修复**
+
+本轮审查专门针对因子挖掘系统在极窄截面（如 Bursa FKLI & FCPO 跨品种套利等，N < 5）下的计算正确性、前瞻偏差漏洞、数据对齐规范以及潜在的性能瓶颈进行了深度 hardening，确保挖掘出的因子指标无前瞻偏差，计算无冗余慢循环，符合 Bursa 期货市场特性。
+
+### **发现的问题 (Audit Report)**
+1. **数据前置无序隐患**：Step 0 没有在进入计算前对输入数据强行按 `['symbol', 'datetime']` 排序，导致后续的 rolling/expanding 算子直接在乱序数组上计算，存在重大的时序错乱风险。
+2. **窄截面下评估坍塌**：当 Symbol 数量 $N < 5$（如 FCPO-FKLI 跨品种套利）时，系统在 Preprocessing 中正确退化为了时序（TS）模式。但 Step 5 评估与 KPI 计算中却仅依据 `is_panel` 运行截面计算，触发了 `MIN_IC_SAMPLE = 5` 门限拦截，导致指标全部输出为 `NaN`。
+3. **时序模式下的跨品种污染**：在时序模式下对多资产数据计算百分位秩与滚动相关性时，数据被垂直拼接直接传入 `numba_expanding_rank_pct`，造成品种 A 排名卷入品种 B 的历史，引发跨资产数据污染。
+4. **无 Open 列前瞻收益重叠**：无开盘价数据 fallback 计算收益时使用 $Close_{t+p}/Close_t - 1.0$，导致当期价格重叠与前瞻幻觉（如 $p=1$ 时），需进行交易延迟对齐。
+5. **滚动 correlation 对 Newey-West 检验的扭曲**：时序 IC 的 NW t-stat 计算使用高自相关的 rolling correlation 序列，使得 Newey-West 渐进标准误失真，高估因子显著性。
+6. **极短序列 plain t-stat 偏置**：在样本量 $n < 10$ 时退化为 plain t-stat，其分母使用了偏置的总体标准差（除以 $n$）而非无偏的样本标准差（除以 $n-1$），虚高了短序列的显著性。
+7. **TS 分位数累积收益前瞻偏差（导师排雷点）**：原计划计算 TS 模式下的分位数收益若使用全局 `pd.qcut` 会引入“未来函数”。且未将分位数标签写回 `df` 阻碍了直观测试。
+8. **期货换月跳空失真**：FKLI/FCPO 套利交易在主力合约换月（Rollover）时，若直接使用未复权的原始 Close 价格计算收益率，跳空价格会造成极大的回测误差。
+
+---
+
+### **执行与解决方案 (Implementation & Safeguards)**
+1. **强制前置物理排序**：在 `process_pipeline` 的 Step 0，对包含 `['symbol', 'datetime']` 的数据强行进行 `sort_values`。
+2. **评估截面自适应降级**：判定条件由 `is_panel` 细化为 `is_panel_eval = is_panel and not is_few_symbols`。若 $N < 5$，Step 5 统计和 Step 6 分位数自动退化为 TS 模式，输出有效的 rolling 评估指标，消除 `NaN` 坍塌。
+3. **Contiguous Index Bounds 边界切片（绕过 Pandas 慢循环）**：
+   - 提取各 Symbol 连续分布的物理起止索引 `boundaries`，在 Numba 纯 NumPy 层面实现 `numba_grouped_expanding_rank_pct`，并通过底层索引切片实现 `compute_grouped_rolling_corr`，**彻底消除了 Pandas `groupby().apply()` Python 层的慢循环**。
+   - 时序模式下计算出 rolling correlation 后，按照 `datetime` 进行日度求均值折叠，代表组合的真实日度 Rank IC，作为 `ic_series` 返回。
+4. **交易延迟前向收益对齐 & 合约警告**：
+   - 无开盘价时收益计算调整为：$\text{ret}_{t, p} = \frac{\text{Close}_{t+1+p}}{\text{Close}_{t+1}} - 1.0$，锁定延迟 1 期开仓，清除前瞻偏差。
+   - 当检测到 Symbol 中含有 `FKLI` 或 `FCPO` 且无开盘价时，控制台自动触发警告，提示用户使用“复权连续主力合约价格”，防止跨换月日价格跳空污染。
+5. **日度 Spearman IC 代理序列 NW 校准**：
+   - 使用因子与收益率历史扩张秩标准化后的点积作为日度 IC 代理序列：$\text{Proxy}_t = \tilde{R}(F)_t \times \tilde{R}(R)_t$。该序列不带滚动窗口移动平均结构，NW 调整能准确给出无偏的 robust t-stat。
+6. **无偏小样本标准差修正**：
+   - Fallback 小样本检验标准差计算分母修正为无偏样本方差的 $n-1$，拉平精度。
+7. **Look-Ahead-Free 动态时序分位数与标签落盘**：
+   - 依据动态计算的 `ranked_factor` Percentile 映射分配为 `[1, 2, 3, 4, 5]` 的分位数分组，**100% 杜绝全局未来函数**，同时将分组写入 `df['quantile_group']` 输出至 `signal_df`，直接硬化了测试和因子的可验证性。
+
+---
+
+### **自动化测试与防线建设**
+1. **移除了 test_alpha_leakage.py 中的硬编码绝对路径**，改用 `os.path.join(os.path.dirname(__file__), ...)` 自适应相对路径。
+2. **重构并加固了 test_early_sorting_and_numba_grouped_rank_correctness**：传入经随机打散（Shuffle）的 DataFrame，断言排序前后的计算输出完全相同，且在 Z-score 扩张状态下对 Day 10, 11, 12 进行**数值型真实分位数标签断言**，封杀假测试。
+3. **加固了 test_lookahead_free_ts_quantile_assignment**：利用新增的 `quantile_group` 直接比对修改未来因子前后的历史组别，断言前 15 行的标签序列 100% 对齐。
+4. **测试套件运行**：运行命令 `$env:PYTHONPATH="."; D:\Miniconda3\envs\QuantLab\python.exe -m pytest tests/`，全量 **74 个测试用例全部 Passed**。

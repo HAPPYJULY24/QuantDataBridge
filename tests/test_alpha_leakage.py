@@ -7,8 +7,9 @@ def test_time_series_look_ahead_leakage_production():
     """
     【生产级】针对时序拓展去极值(Bug B)与拓展Rank IC(Bug A)的全链路前瞻偏差测试
     """
-    # 1. 接入用户配置的数据路径
-    data_path = r"d:\personal\quant\Quant\-\datacenter\RawData\alignment\aligned_MYX-FCPO1_ZL1.parquet"
+    import os
+    current_dir = os.path.dirname(__file__)
+    data_path = os.path.join(current_dir, "..", "datacenter", "RawData", "alignment", "aligned_MYX-FCPO1_ZL1.parquet")
     df_raw = pd.read_parquet(data_path) 
     
     # 强行规范化列名和映射

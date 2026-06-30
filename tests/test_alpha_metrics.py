@@ -97,12 +97,12 @@ def test_ic_decay_win_rate_is_period_specific_and_legacy_metrics_stay_primary():
     assert np.isclose(result["metrics"]["Win Rate"], table.loc[1, "Win Rate"])
     assert np.isclose(table.loc[2, "Win Rate"], table.loc[2, "Directional Win Rate"])
     assert table.loc[1, "Sample Type"] == "cross_sectional_periods"
-    assert table.loc[1, "N"] == 5
-    assert table.loc[2, "N"] == 4
+    assert table.loc[1, "N"] == 4
+    assert table.loc[2, "N"] == 3
     assert table.loc[1, "Raw Obs N"] == len(df)
     assert table.loc[1, "Analysis Obs N"] == len(df)
-    assert table.loc[1, "Valid Return Obs N"] == 30
-    assert table.loc[2, "Valid Return Obs N"] == 24
+    assert table.loc[1, "Valid Return Obs N"] == 24
+    assert table.loc[2, "Valid Return Obs N"] == 18
     assert table.loc[1, "T-Stat Method"] == "newey_west"
     assert table.loc[1, "P-Value Method"] == "approx_from_displayed_t_stat"
     assert np.isclose(table.loc[1, "T-Stat"], table.loc[1, "NW T-Stat"])
@@ -121,7 +121,7 @@ def test_time_series_metrics_use_rolling_rank_ic_schema_and_sample_type():
     )
 
     row = result["ic_decay_table"].loc[1]
-    valid_return_n = len(df) - 1
+    valid_return_n = len(df) - 2
     rolling_window = min(30, valid_return_n // 2) if valid_return_n > 30 else valid_return_n
     expected_n = valid_return_n - rolling_window + 1
 
@@ -151,8 +151,8 @@ def test_negative_factor_keeps_raw_positive_win_rate_and_directional_win_rate():
     row = result["ic_decay_table"].loc[1]
 
     assert row["Rank IC"] < 0
-    assert np.isclose(row["Positive IC Win Rate"], 0.4)
-    assert np.isclose(row["Directional Win Rate"], 0.6)
+    assert np.isclose(row["Positive IC Win Rate"], 0.5)
+    assert np.isclose(row["Directional Win Rate"], 0.5)
     assert np.isclose(row["Win Rate"], row["Directional Win Rate"])
     assert np.isclose(result["metrics"]["Positive IC Win Rate"], row["Positive IC Win Rate"])
     assert np.isclose(result["metrics"]["Win Rate"], row["Directional Win Rate"])

@@ -54,6 +54,41 @@ if HAS_NUMBA:
         return out
 
     @nb.njit(cache=True)
+    def numba_grouped_expanding_rank_pct(arr: np.ndarray, boundaries: np.ndarray, min_periods: int = 10) -> np.ndarray:
+        n = arr.shape[0]
+        out = np.empty(n, dtype=np.float64)
+        for g in range(boundaries.shape[0] - 1):
+            start = boundaries[g]
+            end = boundaries[g+1]
+            group_len = end - start
+            for i in range(group_len):
+                idx = start + i
+                if i < min_periods - 1:
+                    out[idx] = np.nan
+                    continue
+                val = arr[idx]
+                if np.isnan(val):
+                    out[idx] = np.nan
+                    continue
+                less_count = 0
+                equal_count = 0
+                valid_count = 0
+                for j in range(start, idx + 1):
+                    x = arr[j]
+                    if not np.isnan(x):
+                        valid_count += 1
+                        if x < val:
+                            less_count += 1
+                        elif x == val:
+                            equal_count += 1
+                if valid_count >= min_periods:
+                    rank = less_count + 0.5 * (equal_count - 1) + 1.0
+                    out[idx] = rank / valid_count
+                else:
+                    out[idx] = np.nan
+        return out
+
+    @nb.njit(cache=True)
     def numba_rolling_zscore(arr: np.ndarray, window: int = 30) -> np.ndarray:
         n = arr.shape[0]
         out = np.empty(n, dtype=np.float64)
@@ -86,6 +121,9 @@ if HAS_NUMBA:
 else:
     def numba_expanding_rank_pct(arr: np.ndarray, min_periods: int = 10) -> np.ndarray:
         return vectorized_expanding_rank_pct(arr, min_periods)
+
+    def numba_grouped_expanding_rank_pct(arr: np.ndarray, boundaries: np.ndarray, min_periods: int = 10) -> np.ndarray:
+        return vectorized_grouped_expanding_rank_pct(arr, boundaries, min_periods)
         
     def numba_rolling_zscore(arr: np.ndarray, window: int = 30) -> np.ndarray:
         return numba_rolling_zscore_fallback(arr, window)
@@ -112,6 +150,30 @@ def vectorized_expanding_rank_pct(arr: np.ndarray, min_periods: int = 10) -> np.
         ranks = rankdata(valid_prefix, method='average')
         out[i] = ranks[-1] / valid_count
     return out
+
+
+def vectorized_grouped_expanding_rank_pct(arr: np.ndarray, boundaries: np.ndarray, min_periods: int = 10) -> np.ndarray:
+    n = len(arr)
+    out = np.empty(n, dtype=np.float64)
+    out.fill(np.nan)
+    for g in range(len(boundaries) - 1):
+        start = boundaries[g]
+        end = boundaries[g+1]
+        group_arr = arr[start:end]
+        out[start:end] = vectorized_expanding_rank_pct(group_arr, min_periods)
+    return out
+
+
+def compute_grouped_rolling_corr(ranked_factor: pd.Series, ranked_ret: pd.Series, boundaries: np.ndarray, window: int) -> pd.Series:
+    out = np.full(len(ranked_factor), np.nan)
+    for g in range(len(boundaries) - 1):
+        start = boundaries[g]
+        end = boundaries[g+1]
+        f_slice = ranked_factor.iloc[start:end]
+        r_slice = ranked_ret.iloc[start:end]
+        corr_slice = f_slice.rolling(window=window).corr(r_slice)
+        out[start:end] = corr_slice.values
+    return pd.Series(out, index=ranked_factor.index)
 
 
 def numba_rolling_zscore_fallback(arr: np.ndarray, window: int = 30) -> np.ndarray:
@@ -194,8 +256,8 @@ class AlphaEngine:
         无前瞻偏差收益率对齐：
         如果 open_col 存在，信号在 t 期收盘触发，次日 t+1 期以开盘价买入，t+p 期以收盘价平仓：
             ret = close_{t+p} / open_{t+1} - 1.0
-        如果 open_col 不存在，安全降级为普通的 close-to-close 前向收益率：
-            ret = close_{t+p} / close_t - 1.0
+        如果 open_col 不存在，安全降级为普通的 close-to-close 前向收益率（使用 t+1 期收盘买入以消除同期价格重叠偏差）：
+            ret = close_{t+1+p} / close_{t+1} - 1.0
         """
         df = df.copy()
         
@@ -205,18 +267,35 @@ class AlphaEngine:
             if open_col not in df.columns:
                 open_col = None
         
+        # Check for futures rollover gap warning
+        is_futures = False
+        if 'symbol' in df.columns:
+            unique_syms = df['symbol'].dropna().unique()
+            for s in unique_syms:
+                s_lower = str(s).lower()
+                if 'fkli' in s_lower or 'fcpo' in s_lower:
+                    is_futures = True
+                    break
+        
+        if is_futures and not open_col:
+            warnings.warn(
+                "⚠️ [FUTURES ROLLOVER WARNING] FKLI/FCPO dataset detected without open price column. "
+                "Ensure that close prices are continuous adjusted contracts (复权合约) "
+                "to prevent rollover price gaps from distorting the calculated returns."
+            )
+        
         for p in periods:
             col_name = f'ret_{p}'
             if 'symbol' in df.columns:
                 if open_col:
                     df[col_name] = df.groupby('symbol')[price_col].shift(-p) / df.groupby('symbol')[open_col].shift(-1) - 1.0
                 else:
-                    df[col_name] = df.groupby('symbol')[price_col].shift(-p) / df[price_col] - 1.0
+                    df[col_name] = df.groupby('symbol')[price_col].shift(-1-p) / df.groupby('symbol')[price_col].shift(-1) - 1.0
             else:
                 if open_col:
                     df[col_name] = df[price_col].shift(-p) / df[open_col].shift(-1) - 1.0
                 else:
-                    df[col_name] = df[price_col].shift(-p) / df[price_col] - 1.0
+                    df[col_name] = df[price_col].shift(-1-p) / df[price_col].shift(-1) - 1.0
             
             df[col_name] = df[col_name].replace([np.inf, -np.inf], np.nan)
             
@@ -240,7 +319,8 @@ class AlphaEngine:
         # making the HAC estimator unreliable. Fall back to plain t-stat.
         gamma_0 = float(np.sum((series - mean_val) ** 2) / n)
         if n < 10:
-            se_plain = np.sqrt(gamma_0 / n) if gamma_0 > 0 else 0.0
+            gamma_0_unbiased = float(np.sum((series - mean_val) ** 2) / (n - 1)) if n > 1 else 0.0
+            se_plain = np.sqrt(gamma_0_unbiased / n) if gamma_0_unbiased > 0 else 0.0
             return AlphaEngine._clean_stat_value(mean_val / se_plain if se_plain != 0 else 0.0)
         max_lag = int(np.floor(4 * (n / 100) ** (2 / 9)))
         x = series - mean_val
@@ -275,6 +355,12 @@ class AlphaEngine:
         if 'datetime' in df.columns:
             df['datetime'] = pd.to_datetime(df['datetime'])
             # df = df.set_index('datetime', drop=False) # Avoid ambiguity
+
+        # Early sort to guarantee chronological order for expanding/rolling window operations
+        if 'symbol' in df.columns and 'datetime' in df.columns:
+            df = df.sort_values(['symbol', 'datetime']).copy()
+        elif 'datetime' in df.columns:
+            df = df.sort_values('datetime').copy()
 
         periods = sorted({int(p) for p in periods})
         if not periods or any(p <= 0 for p in periods):
@@ -607,6 +693,8 @@ class AlphaEngine:
             pearson = valid['factor'].corr(valid[ret_c], method='pearson')
             return pd.Series({'Rank_IC': spearman, 'IC': pearson, 'uniqueness_warning': False})
 
+        is_panel_eval = is_panel and not is_few_symbols
+
         for p in periods:
             ret_col = f'ret_{p}'
             
@@ -624,7 +712,7 @@ class AlphaEngine:
             if eval_period_df.empty:
                 continue
                 
-            if is_panel:
+            if is_panel_eval:
                 ic_daily = eval_period_df.groupby('datetime')[['factor', ret_col]].apply(lambda g: calc_ic_period(g, ret_col))
                 ic_daily = ic_daily.replace([np.inf, -np.inf], np.nan).dropna(subset=['Rank_IC'])
                 rank_ic_mean = ic_daily['Rank_IC'].mean()
@@ -633,33 +721,80 @@ class AlphaEngine:
                 n_samples = int(ic_daily['Rank_IC'].count()) # Number of valid IC observations
                 ic_eval_series = ic_daily['Rank_IC'].dropna()
                 
+                if p == primary_period:
+                     primary_ic_series = ic_daily[['Rank_IC']]
+                
             else:
                 # Time Series Mode: all displayed IC statistics are based on
                 # one rolling Rank IC series to avoid mixed statistical bases.
                 window = min(30, len(eval_period_df) // 2) if len(eval_period_df) > 30 else len(eval_period_df)
-                # Expanding rank with min_periods=10 warm-up guard to prevent look-ahead bias
-                # 静态编译/等价 Fallback 加速，彻底破除 O(N^2) 慢循环性能崩塌 (L669-674)
-                ranked_factor_vals = numba_expanding_rank_pct(eval_period_df['factor'].values, min_periods=10)
+                
+                # Check for symbol boundaries to run grouped expanding rank & rolling correlation
+                if 'symbol' in eval_period_df.columns:
+                    sym_vals = eval_period_df['symbol'].values
+                    change_indices = np.where(sym_vals[:-1] != sym_vals[1:])[0] + 1
+                    boundaries = np.zeros(len(change_indices) + 2, dtype=np.int64)
+                    boundaries[0] = 0
+                    boundaries[1:-1] = change_indices
+                    boundaries[-1] = len(eval_period_df)
+                    
+                    ranked_factor_vals = numba_grouped_expanding_rank_pct(eval_period_df['factor'].values, boundaries, min_periods=10)
+                    ranked_ret_vals = numba_grouped_expanding_rank_pct(eval_period_df[ret_col].values, boundaries, min_periods=10)
+                else:
+                    boundaries = np.array([0, len(eval_period_df)], dtype=np.int64)
+                    ranked_factor_vals = numba_expanding_rank_pct(eval_period_df['factor'].values, min_periods=10)
+                    ranked_ret_vals = numba_expanding_rank_pct(eval_period_df[ret_col].values, min_periods=10)
+                
                 ranked_factor = pd.Series(ranked_factor_vals, index=eval_period_df.index).fillna(eval_period_df['factor'])
-                
-                ranked_ret_vals = numba_expanding_rank_pct(eval_period_df[ret_col].values, min_periods=10)
                 ranked_ret = pd.Series(ranked_ret_vals, index=eval_period_df.index).fillna(eval_period_df[ret_col])
-                rolling_rank_ic = ranked_factor.rolling(window=window).corr(ranked_ret)
                 
-                # BUG FIX: corr() can sometimes output np.inf or -np.inf due to precision/zero-division,
-                # which causes np.nanmean to return 'nan'. We must explicitly replace infs with nan.
-                rolling_rank_ic = rolling_rank_ic.replace([np.inf, -np.inf], np.nan).dropna()
+                # Compute rolling rank correlation grouped by symbol or globally
+                if 'symbol' in eval_period_df.columns:
+                    rolling_rank_ic = compute_grouped_rolling_corr(ranked_factor, ranked_ret, boundaries, window)
+                else:
+                    rolling_rank_ic = ranked_factor.rolling(window=window).corr(ranked_ret)
                 
+                rolling_rank_ic = rolling_rank_ic.replace([np.inf, -np.inf], np.nan)
+                
+                # Calculate daily Spearman Rank IC proxy series: product of rank-standardized variables
+                # This has no rolling window autocorrelation and is mathematically robust.
+                f_rank_mean = ranked_factor.mean()
+                f_rank_std = ranked_factor.std()
+                r_rank_mean = ranked_ret.mean()
+                r_rank_std = ranked_ret.std()
+                if f_rank_std > 0 and r_rank_std > 0:
+                    f_rank_norm = (ranked_factor - f_rank_mean) / f_rank_std
+                    r_rank_norm = (ranked_ret - r_rank_mean) / r_rank_std
+                    ic_eval_series = (f_rank_norm * r_rank_norm).dropna()
+                else:
+                    ic_eval_series = pd.Series(0.0, index=eval_period_df.index)
+                
+                # If there are multiple symbols, collapse rolling correlation and proxy series by taking daily average
+                if 'symbol' in eval_period_df.columns and 'datetime' in eval_period_df.columns:
+                    rolling_rank_ic_daily = rolling_rank_ic.groupby(eval_period_df['datetime']).mean()
+                    rolling_rank_ic_daily = rolling_rank_ic_daily.replace([np.inf, -np.inf], np.nan).dropna()
+                    
+                    ic_eval_series_daily = ic_eval_series.groupby(eval_period_df['datetime']).mean()
+                    ic_eval_series = ic_eval_series_daily.dropna()
+                    
+                    rank_ic_mean = rolling_rank_ic_daily.mean()
+                    rank_ic_std = rolling_rank_ic_daily.std()
+                    n_samples = int(rolling_rank_ic_daily.count())
+                    
+                    if p == primary_period:
+                         primary_ic_series = pd.DataFrame({'Rank_IC': rolling_rank_ic_daily})
+                else:
+                    rolling_rank_ic = rolling_rank_ic.dropna()
+                    rank_ic_mean = rolling_rank_ic.mean()
+                    rank_ic_std = rolling_rank_ic.std()
+                    n_samples = int(rolling_rank_ic.count())
+                    ic_eval_series = ic_eval_series.dropna()
+                    
+                    if p == primary_period:
+                         primary_ic_series = pd.DataFrame({'Rank_IC': rolling_rank_ic})
+                         
                 res = calc_ic_period(eval_period_df, ret_col)
                 ic_mean = res['IC']
-                rank_ic_mean = rolling_rank_ic.mean()
-                rank_ic_std = rolling_rank_ic.std()
-                n_samples = int(rolling_rank_ic.count())
-                ic_eval_series = rolling_rank_ic.dropna()
-                
-                if p == primary_period:
-                     # Save primary rolling series for visualization (now truly Rank IC)
-                     primary_ic_series = pd.DataFrame({'Rank_IC': rolling_rank_ic})
             
             # Common Stats
             rank_ic_mean = clean_stat_value(rank_ic_mean)
@@ -672,7 +807,7 @@ class AlphaEngine:
             positive_win_rate = clean_stat_value((ic_eval_series > 0).mean() if len(ic_eval_series) > 0 else 0.0)
             directional_win_rate = 1 - positive_win_rate if rank_ic_mean < 0 else positive_win_rate
             directional_win_rate = clean_stat_value(directional_win_rate)
-            sample_type = 'cross_sectional_periods' if is_panel else 'rolling_rank_ic_points'
+            sample_type = 'cross_sectional_periods' if is_panel_eval else 'rolling_rank_ic_points'
             raw_obs_n = int(original_row_count)
             analysis_obs_n = int(len(df))
             valid_return_obs_n = int(len(eval_period_df))
@@ -713,7 +848,7 @@ class AlphaEngine:
                 metrics['Directional Win Rate'] = directional_win_rate
                 metrics['Win Rate'] = directional_win_rate
                 
-                if is_panel:
+                if is_panel_eval:
                      primary_ic_series = ic_daily[['Rank_IC']]
 
                      # CRITICAL-01 FIX: Lookahead bias heuristic detection
@@ -744,7 +879,12 @@ class AlphaEngine:
                  ret_col_primary = None
         
         if ret_col_primary and ret_col_primary in df.columns:
-             eval_q_df = df[['factor', ret_col_primary] + (['datetime'] if 'datetime' in df.columns else [])].replace([np.inf, -np.inf], np.nan).dropna(subset=['factor', ret_col_primary])
+             cols_to_select = ['factor', ret_col_primary]
+             if 'datetime' in df.columns:
+                 cols_to_select.append('datetime')
+             if 'symbol' in df.columns:
+                 cols_to_select.append('symbol')
+             eval_q_df = df[cols_to_select].replace([np.inf, -np.inf], np.nan).dropna(subset=['factor', ret_col_primary])
         else:
              eval_q_df = pd.DataFrame() # Empty to skip
 
@@ -757,16 +897,61 @@ class AlphaEngine:
                 except ValueError:
                     return pd.Series()
 
-            if is_panel:
+            if is_panel_eval:
                  q_daily = eval_q_df.groupby('datetime')[['factor', ret_col_primary]].apply(quintile_ret).unstack(level=-1)
                  quantile_returns = q_daily.mean()
                  # Use geometric compounding for discrete returns, not arithmetic cumsum
                  quantile_cum_ret = q_daily.add(1).cumprod() - 1
+                 
+                 def assign_quintile_group(group):
+                     group = group.copy()
+                     try:
+                         group['quantile_group'] = pd.qcut(group['factor'], 5, labels=False, duplicates='drop') + 1
+                     except ValueError:
+                         group['quantile_group'] = 3
+                     return group
+                 df['quantile_group'] = eval_q_df.groupby('datetime', group_keys=False).apply(assign_quintile_group)['quantile_group']
             else:
-                 # Time-Series Mode: No daily aggregation for cumsum in same way
-                 quantile_returns = quintile_ret(eval_q_df)
-                 # For TS, we can't easily do cumulative over time unless we do rolling or expanding.
-                 # Leaving empty for TS or implement if needed.
+                 # Time-Series Mode: Look-ahead-free quantile grouping
+                 # 1. We compute the expanding rank percentile of the factor for each symbol (no look-ahead)
+                 if 'symbol' in eval_q_df.columns:
+                     sym_vals = eval_q_df['symbol'].values
+                     change_indices = np.where(sym_vals[:-1] != sym_vals[1:])[0] + 1
+                     boundaries = np.zeros(len(change_indices) + 2, dtype=np.int64)
+                     boundaries[0] = 0
+                     boundaries[1:-1] = change_indices
+                     boundaries[-1] = len(eval_q_df)
+                     
+                     ranked_f = numba_grouped_expanding_rank_pct(eval_q_df['factor'].values, boundaries, min_periods=10)
+                 else:
+                     ranked_f = numba_expanding_rank_pct(eval_q_df['factor'].values, min_periods=10)
+                 
+                 ranked_f_series = pd.Series(ranked_f, index=eval_q_df.index)
+                 
+                 # 2. Map percentile [0.0, 1.0] to Q1-Q5 bins using history up to time t (look-ahead free)
+                 eval_q_df = eval_q_df.copy()
+                 eval_q_df['group'] = pd.cut(ranked_f_series, bins=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0], labels=[1, 2, 3, 4, 5], include_lowest=True)
+                 eval_q_df['group'] = pd.to_numeric(eval_q_df['group']).fillna(3).astype(int) # Default to Q3 for NaNs
+                 df['quantile_group'] = eval_q_df['group']
+                 
+                 # 3. Calculate daily mean return for each group
+                 if 'datetime' in eval_q_df.columns:
+                     q_daily = eval_q_df.groupby(['datetime', 'group'])[ret_col_primary].mean().unstack(level=-1)
+                     # Fill missing groups with 0.0 return
+                     for col in range(1, 6):
+                         if col not in q_daily.columns:
+                             q_daily[col] = 0.0
+                     q_daily = q_daily.sort_index(axis=1).fillna(0.0)
+                     quantile_returns = q_daily.mean()
+                     quantile_cum_ret = q_daily.add(1).cumprod() - 1
+                 else:
+                     # Single time series fallback without datetime
+                     quantile_returns = eval_q_df.groupby('group')[ret_col_primary].mean()
+                     q_by_row = pd.DataFrame(0.0, index=eval_q_df.index, columns=range(1, 6))
+                     for g in range(1, 6):
+                         g_mask = (eval_q_df['group'] == g)
+                         q_by_row.loc[g_mask, g] = eval_q_df.loc[g_mask, ret_col_primary]
+                     quantile_cum_ret = q_by_row.add(1).cumprod() - 1
                  
         # 7. Risk Correlation Analysis (Ultimate)
         risk_exposure_df = pd.DataFrame()
@@ -832,7 +1017,7 @@ class AlphaEngine:
                     'raw_rows': original_row_count,
                     'factor_valid_rows': factor_valid_count,
                 },
-                is_panel=is_panel
+                is_panel=is_panel_eval
             ) if ret_col_primary else {}
         }
 
@@ -905,33 +1090,74 @@ class AlphaEngine:
             global_ic_mean = valid_df[factor_name].corr(valid_df[returns_name], method='pearson')
             global_rank_ic_mean = valid_df[factor_name].corr(valid_df[returns_name], method='spearman')
             
-            # --- T-Stat Newey-West Full-Sample Logic ---
-            # Correlation between Factor and Returns 
-            # Proxy IC series as element-wise product of normalized variables
-            f_norm = (valid_df[factor_name] - valid_df[factor_name].mean()) / valid_df[factor_name].std()
-            r_norm = (valid_df[returns_name] - valid_df[returns_name].mean()) / valid_df[returns_name].std()
-            ic_series_ts = (f_norm * r_norm).dropna()
+            # Keep rolling for UI series plot and win rate proxy (Using Spearman/Rank)
+            window = min(30, len(valid_df) // 2) if len(valid_df) > 30 else len(valid_df)
             
+            # Check for symbol boundaries to run grouped expanding rank & rolling correlation
+            if 'symbol' in valid_df.columns:
+                sym_vals = valid_df['symbol'].values
+                change_indices = np.where(sym_vals[:-1] != sym_vals[1:])[0] + 1
+                boundaries = np.zeros(len(change_indices) + 2, dtype=np.int64)
+                boundaries[0] = 0
+                boundaries[1:-1] = change_indices
+                boundaries[-1] = len(valid_df)
+                
+                ranked_factor_pro_vals = numba_grouped_expanding_rank_pct(valid_df[factor_name].values, boundaries, min_periods=10)
+                ranked_ret_pro_vals = numba_grouped_expanding_rank_pct(valid_df[returns_name].values, boundaries, min_periods=10)
+            else:
+                boundaries = np.array([0, len(valid_df)], dtype=np.int64)
+                ranked_factor_pro_vals = numba_expanding_rank_pct(valid_df[factor_name].values, min_periods=10)
+                ranked_ret_pro_vals = numba_expanding_rank_pct(valid_df[returns_name].values, min_periods=10)
+            
+            ranked_factor_pro = pd.Series(ranked_factor_pro_vals, index=valid_df.index).fillna(valid_df[factor_name])
+            ranked_ret_pro = pd.Series(ranked_ret_pro_vals, index=valid_df.index).fillna(valid_df[returns_name])
+            
+            # Compute rolling rank correlation grouped by symbol or globally
+            if 'symbol' in valid_df.columns:
+                rolling_rank_ic = compute_grouped_rolling_corr(ranked_factor_pro, ranked_ret_pro, boundaries, window)
+            else:
+                rolling_rank_ic = ranked_factor_pro.rolling(window=window).corr(ranked_ret_pro)
+            
+            rolling_rank_ic = rolling_rank_ic.replace([np.inf, -np.inf], np.nan)
+            
+            # Calculate daily Spearman Rank IC proxy series: product of rank-standardized variables
+            # This has no rolling window autocorrelation and is mathematically robust.
+            f_rank_mean = ranked_factor_pro.mean()
+            f_rank_std = ranked_factor_pro.std()
+            r_rank_mean = ranked_ret_pro.mean()
+            r_rank_std = ranked_ret_pro.std()
+            if f_rank_std > 0 and r_rank_std > 0:
+                f_rank_norm = (ranked_factor_pro - f_rank_mean) / f_rank_std
+                r_rank_norm = (ranked_ret_pro - r_rank_mean) / r_rank_std
+                ic_series_ts = (f_rank_norm * r_rank_norm).dropna()
+            else:
+                ic_series_ts = pd.Series(0.0, index=valid_df.index)
+            
+            # If there are multiple symbols, collapse rolling correlation and proxy series by taking daily average
+            if 'symbol' in valid_df.columns and 'datetime' in valid_df.columns:
+                rolling_rank_ic_daily = rolling_rank_ic.groupby(valid_df['datetime']).mean()
+                rolling_rank_ic_daily = rolling_rank_ic_daily.replace([np.inf, -np.inf], np.nan).dropna()
+                
+                ic_series_ts_daily = ic_series_ts.groupby(valid_df['datetime']).mean()
+                ic_series_ts = ic_series_ts_daily.dropna()
+                
+                rank_ic_mean = rolling_rank_ic_daily.mean()
+                rank_ic_std = rolling_rank_ic_daily.std()
+                n_samples = int(rolling_rank_ic_daily.count())
+                
+                rolling_rank_ic = rolling_rank_ic_daily
+            else:
+                rolling_rank_ic = rolling_rank_ic.dropna()
+                rank_ic_mean = rolling_rank_ic.mean()
+                rank_ic_std = rolling_rank_ic.std()
+                n_samples = int(rolling_rank_ic.count())
+                ic_series_ts = ic_series_ts.dropna()
+                
             ic_std = ic_series_ts.std()
             ic_mean = global_ic_mean
             
-            # Keep rolling for UI series plot and win rate proxy (Using Spearman/Rank)
-            window = min(30, len(valid_df) // 2) if len(valid_df) > 30 else len(valid_df)
-            # Expanding rank with min_periods=10 warm-up guard to prevent look-ahead bias
-            # 静态编译/等价 Fallback 加速，破除 O(N^2) 慢循环 (L949-954)
-            ranked_factor_pro_vals = numba_expanding_rank_pct(valid_df[factor_name].values, min_periods=10)
-            ranked_factor_pro = pd.Series(ranked_factor_pro_vals, index=valid_df.index).fillna(valid_df[factor_name])
-            
-            ranked_ret_pro_vals = numba_expanding_rank_pct(valid_df[returns_name].values, min_periods=10)
-            ranked_ret_pro = pd.Series(ranked_ret_pro_vals, index=valid_df.index).fillna(valid_df[returns_name])
-            rolling_rank_ic = ranked_factor_pro.rolling(window=window).corr(ranked_ret_pro)
-            # Safely replace Inf values from Zero-Division correlation anomalies
-            rolling_rank_ic = rolling_rank_ic.replace([np.inf, -np.inf], np.nan).dropna()
-            rank_ic_mean = rolling_rank_ic.mean()
-            rank_ic_std = rolling_rank_ic.std()
-            n_samples = int(len(rolling_rank_ic))
             plain_t_stat = rank_ic_mean / (rank_ic_std / np.sqrt(n_samples)) if rank_ic_std != 0 and n_samples > 1 else 0
-            nw_t_stat = self._newey_west_t_stat(rolling_rank_ic)
+            nw_t_stat = self._newey_west_t_stat(ic_series_ts)
             t_stat = nw_t_stat
 
         # IC IR
